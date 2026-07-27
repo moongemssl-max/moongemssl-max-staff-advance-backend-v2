@@ -116,40 +116,170 @@ async function sendAdvanceRequestNotification(requestData) {
 }
 
 async function sendAttendanceNotification(data) {
-  const snapshot = await db.collection(TOKENS_COLLECTION).where('active', '==', true).get();
-  const tokens = [...new Set(snapshot.docs.map(doc => String(doc.data().token || '').trim()).filter(Boolean))];
-  if (!tokens.length) return { success: false, skipped: true, reason: 'No registered devices' };
-  const isCheckIn = data.action === 'check_in';
-  const title = isCheckIn ? 'Attendance Check In' : 'Attendance Check Out';
-  const mapsLink = String(data.location?.googleMapsLink || '');
-  const locationText = mapsLink ? ' • Location captured' : '';
-  const body = `${data.employeeName} • ${data.time}${isCheckIn ? ` • ${data.status}` : ''}${locationText}`;
-  const invalidTokens = []; let successCount = 0; let failureCount = 0;
-  for (let index = 0; index < tokens.length; index += 500) {
-    const chunk = tokens.slice(index, index + 500);
-    const response = await admin.messaging().sendEachForMulticast({
-      tokens: chunk,
-      data: {
-        type: 'attendance',
-        title,
-        body,
-        employeeName: String(data.employeeName || ''),
-        employeePhone: String(data.employeePhone || ''),
-        action: String(data.action || ''),
-        status: String(data.status || ''),
-        workDate: String(data.workDate || ''),
-        time: String(data.time || ''),
-        latitude: data.location ? String(data.location.latitude) : '',
-        longitude: data.location ? String(data.location.longitude) : '',
-        googleMapsLink: mapsLink
-      },
-      android: { priority: 'high' }
-    });
-    successCount += response.successCount; failureCount += response.failureCount;
-    response.responses.forEach((item, i) => { if (!item.success && ['messaging/registration-token-not-registered','messaging/invalid-registration-token'].includes(item.error?.code || '')) invalidTokens.push(chunk[i]); });
+  const snapshot = await db
+    .collection(TOKENS_COLLECTION)
+    .where('active', '==', true)
+    .get();
+
+  const tokens = [
+    ...new Set(
+      snapshot.docs
+        .map(doc =>
+          String(doc.data().token || '').trim()
+        )
+        .filter(Boolean)
+    )
+  ];
+
+  if (!tokens.length) {
+    console.warn(
+      'No registered FCM device tokens. Attendance notification skipped.'
+    );
+
+    return {
+      success: false,
+      skipped: true,
+      reason: 'No registered devices'
+    };
   }
-  await removeInvalidTokens(invalidTokens);
-  return { success: successCount > 0, successCount, failureCount };
+
+  const isCheckIn =
+    data.action === 'check_in';
+
+  const title = isCheckIn
+    ? 'Attendance Check In'
+    : 'Attendance Check Out';
+
+  const latitude =
+    data.latitude !== undefined &&
+    data.latitude !== null
+      ? String(data.latitude)
+      : '';
+
+  const longitude =
+    data.longitude !== undefined &&
+    data.longitude !== null
+      ? String(data.longitude)
+      : '';
+
+  const mapsLink = String(
+    data.googleMapsLink || ''
+  );
+
+  const locationText = mapsLink
+    ? ` • Location captured`
+    : '';
+
+  const body =
+    `${data.employeeName} • ${data.time}` +
+    `${isCheckIn ? ` • ${data.status}` : ''}` +
+    locationText;
+
+  const invalidTokens = [];
+
+  let successCount = 0;
+  let failureCount = 0;
+
+  for (
+    let index = 0;
+    index < tokens.length;
+    index += 500
+  ) {
+    const chunk =
+      tokens.slice(index, index + 500);
+
+    const response =
+      await admin
+        .messaging()
+        .sendEachForMulticast({
+          tokens: chunk,
+
+          data: {
+            type: 'attendance',
+
+            title,
+            body,
+
+            employeeName: String(
+              data.employeeName || ''
+            ),
+
+            employeePhone: String(
+              data.employeePhone || ''
+            ),
+
+            action: String(
+              data.action || ''
+            ),
+
+            status: String(
+              data.status || ''
+            ),
+
+            workDate: String(
+              data.workDate || ''
+            ),
+
+            time: String(
+              data.time || ''
+            ),
+
+            latitude,
+            longitude,
+            googleMapsLink: mapsLink
+          },
+
+          android: {
+            priority: 'high'
+          }
+        });
+
+    successCount +=
+      response.successCount;
+
+    failureCount +=
+      response.failureCount;
+
+    response.responses.forEach(
+      (item, responseIndex) => {
+        if (item.success) return;
+
+        const code =
+          item.error?.code || '';
+
+        console.error(
+          'Attendance FCM error:',
+          code,
+          item.error?.message ||
+            'Unknown error'
+        );
+
+        if (
+          code ===
+            'messaging/registration-token-not-registered' ||
+          code ===
+            'messaging/invalid-registration-token'
+        ) {
+          invalidTokens.push(
+            chunk[responseIndex]
+          );
+        }
+      }
+    );
+  }
+
+  await removeInvalidTokens(
+    invalidTokens
+  );
+
+  return {
+    success: successCount > 0,
+    skipped: false,
+    successCount,
+    failureCount,
+    removedInvalidTokens:
+      invalidTokens.length
+  };
 }
 
 module.exports = {
