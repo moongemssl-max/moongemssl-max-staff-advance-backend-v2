@@ -1,0 +1,6 @@
+1. Upload/push this folder to the same GitHub repository used by Render.
+2. In Render, deploy the latest commit.
+3. Add optional environment variable ATTENDANCE_LATE_AFTER=08:30.
+4. Test: open https://YOUR-SERVICE.onrender.com/attendance
+5. Open the Android app for 30 seconds so employees sync to Firestore.
+6. Test with one employee's registered phone number and last 4 digits PIN.

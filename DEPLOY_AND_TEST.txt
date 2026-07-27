@@ -1,0 +1,11 @@
+Notification backend deployment test
+
+1. Upload every file/folder in this project to the root of the GitHub repository.
+2. Wait for Render deployment to finish.
+3. Open https://staff-advance-backend-v2.onrender.com/
+   It MUST show: "version":"2.3.0-notifications"
+4. Open https://staff-advance-backend-v2.onrender.com/api/notification-status
+   After opening the Android app once, activeDevices should be 1 or more.
+5. Send a fresh WhatsApp advance request. Render Logs should show:
+   - Saved WhatsApp request
+   - FCM notification result

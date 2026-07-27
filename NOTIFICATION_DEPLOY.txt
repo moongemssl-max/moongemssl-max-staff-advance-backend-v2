@@ -1,0 +1,19 @@
+STAFF ADVANCE BACKEND - PUSH NOTIFICATIONS
+==========================================
+
+This version keeps the existing WhatsApp webhook and approve/reject auto reply,
+and adds Firebase Cloud Messaging notifications.
+
+New API endpoint used by Android:
+POST /api/device-token
+Body: { "token": "FCM_TOKEN", "deviceName": "Phone name" }
+
+When a valid WhatsApp advance request is saved, the backend sends:
+Title: New Advance Request
+Body: <Employee> requested Rs. <amount>
+
+No new Render environment variables are required. The existing Firebase Admin
+credentials are used for both Firestore and FCM.
+
+Deploy by replacing the files in the existing GitHub repository with the files
+from this ZIP and committing them. Render should auto-deploy.

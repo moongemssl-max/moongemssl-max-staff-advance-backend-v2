@@ -1,0 +1,9 @@
+Phase 9 validation completed
+- Base: original user-uploaded Render-Backend.tar
+- All backend JavaScript files passed node --check
+- Embedded attendance-page JavaScript passed node --check
+- Record Attendance button text is absent
+- Auto attendance starts on window load
+- GPS coordinates are sent to POST /attendance/scan/:token/mark
+- Firestore fields: checkInLocation/checkOutLocation/latestLocation
+- Google Maps link is included in stored location and notification data

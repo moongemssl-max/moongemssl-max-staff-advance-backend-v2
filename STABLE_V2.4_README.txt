@@ -1,0 +1,15 @@
+STAFF ADVANCE BACKEND v2.4 STABLE ACTIONS
+
+This backend matches Android v8.1 Stable.
+
+Important:
+- Deploy to the GitHub repository connected to Render service:
+  https://staff-advance-backend.onrender.com/
+- Keep all current Render environment variables unchanged.
+- FCM payload is data-only so Android can build notifications with APPROVE/REJECT buttons.
+- Approval/rejection API still sends the WhatsApp reply and updates Firestore.
+
+After deployment:
+1. Confirm /health returns ok.
+2. Open the Android app once so its FCM token registers.
+3. Send a new WhatsApp advance request.
