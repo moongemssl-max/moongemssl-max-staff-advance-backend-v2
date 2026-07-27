@@ -116,6 +116,7 @@ async function sendAdvanceRequestNotification(requestData) {
 }
 
 async function sendAttendanceNotification(data) {
+ console.log("Attendance notification data:", data); 
   const snapshot = await db
     .collection(TOKENS_COLLECTION)
     .where('active', '==', true)
