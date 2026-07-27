@@ -152,20 +152,20 @@ async function sendAttendanceNotification(data) {
     : 'Attendance Check Out';
 
   const latitude =
-    data.latitude !== undefined &&
-    data.latitude !== null
-      ? String(data.latitude)
+    data.location?.latitude !== undefined &&
+    data.location?.latitude !== null
+      ? String(data.location.latitude)
       : '';
 
-  const longitude =
-    data.longitude !== undefined &&
-    data.longitude !== null
-      ? String(data.longitude)
+const longitude =
+    data.location?.longitude !== undefined &&
+    data.location?.longitude !== null
+      ? String(data.location.longitude)
       : '';
 
-  const mapsLink = String(
-    data.googleMapsLink || ''
-  );
+const mapsLink = String(
+    data.location?.googleMapsLink || ''
+);
 
   const locationText = mapsLink
     ? ` • Location captured`
