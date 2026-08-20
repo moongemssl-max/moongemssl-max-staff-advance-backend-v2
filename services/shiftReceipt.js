@@ -488,15 +488,20 @@ async function recognizeReceipt(imageBuffer) {
   }
 }
 
+function calculateBringAmount(actualEndingCash, balance) {
+  return Math.round((Number(actualEndingCash) - Number(balance)) * 100) / 100;
+}
+
 function buildReply(result) {
-  const remainingAmount = Math.round((Number(result.actualEndingCash) - Number(result.balance)) * 100) / 100;
-  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(remainingAmount)} දාලා රැගෙන එන්න.`;
+  const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
+  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} රැගෙන එන්න.`;
 }
 
 module.exports = {
   downloadWhatsAppImage,
   recognizeReceipt,
   calculateBalance,
+  calculateBringAmount,
   buildReply,
   formatMoney
 };
