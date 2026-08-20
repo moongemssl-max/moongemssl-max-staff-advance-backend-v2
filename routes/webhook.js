@@ -68,7 +68,7 @@ async function processShiftReceiptImage(message, senderNumber) {
         { merge: true }
       );
 
-      console.warn('Shift receipt OCR failed:', message.id, result.reason);
+      console.warn('Shift receipt OCR failed:', message.id, result.reason, result.branchOcrPreview || '');
       return;
     }
 
