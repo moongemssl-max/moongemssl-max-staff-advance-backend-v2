@@ -153,6 +153,38 @@ function extractBranch(lines) {
   return { branch: null, branchRaw: null };
 }
 
+function lineHasFuzzyWords(line, words, maxDistance = 2) {
+  return words.every((word) => fuzzyContains(line, word, maxDistance));
+}
+
+function findNearbyMoney(lines, index, maxDistance = 2) {
+  // Prefer the labelled line itself. Thermal-printer OCR sometimes puts the amount
+  // on a separate adjacent line, so also inspect a small neighbourhood.
+  const direct = extractLastMoney(lines[index]);
+  if (direct !== null) return direct;
+
+  for (let distance = 1; distance <= maxDistance; distance += 1) {
+    for (const neighbour of [index + distance, index - distance]) {
+      if (neighbour < 0 || neighbour >= lines.length) continue;
+      const candidateLine = normalizeLine(lines[neighbour]);
+      if (!candidateLine) continue;
+
+      // Do not steal a value from the next labelled drawer row.
+      const normalized = similarityText(candidateLine);
+      const looksLikeAnotherLabel = [
+        'startingcash', 'netcashinflow', 'expectedendingcash',
+        'actualendingcash', 'difference'
+      ].some((label) => normalized.includes(label));
+      if (looksLikeAnotherLabel) continue;
+
+      const amount = extractLastMoney(candidateLine);
+      if (amount !== null) return amount;
+    }
+  }
+
+  return null;
+}
+
 function findDrawerValues(lines) {
   const values = {
     startingCash: null,
@@ -162,16 +194,68 @@ function findDrawerValues(lines) {
     difference: null
   };
 
-  for (const rawLine of lines) {
-    const line = normalizeLine(rawLine);
-    const amount = extractLastMoney(line);
-    if (amount === null) continue;
+  const normalizedLines = lines.map((line) => normalizeLine(line)).filter(Boolean);
 
-    if (looksLike(line, ['starting', 'cash'])) values.startingCash = amount;
-    else if (looksLike(line, ['net', 'cash', 'inflow'])) values.netCashInflow = amount;
-    else if (looksLike(line, ['expected', 'ending', 'cash'])) values.expectedEndingCash = amount;
-    else if (looksLike(line, ['actual', 'ending', 'cash'])) values.actualEndingCash = amount;
-    else if (similarityText(line).includes('difference')) values.difference = amount;
+  for (let index = 0; index < normalizedLines.length; index += 1) {
+    const line = normalizedLines[index];
+    const compact = similarityText(line);
+
+    const isStarting = looksLike(line, ['starting', 'cash']) ||
+      lineHasFuzzyWords(line, ['starting', 'cash'], 2);
+    const isNetInflow = looksLike(line, ['net', 'cash', 'inflow']) ||
+      lineHasFuzzyWords(line, ['net', 'cash', 'inflow'], 2);
+    const isExpected = looksLike(line, ['expected', 'ending', 'cash']) ||
+      lineHasFuzzyWords(line, ['expected', 'ending', 'cash'], 2);
+    const isActual = looksLike(line, ['actual', 'ending', 'cash']) ||
+      lineHasFuzzyWords(line, ['actual', 'ending', 'cash'], 2) ||
+      (fuzzyContains(line, 'actual', 2) && fuzzyContains(line, 'ending', 2));
+    const isDifference = compact.includes('difference') || fuzzyContains(line, 'difference', 3);
+
+    if (isStarting && values.startingCash === null) {
+      values.startingCash = findNearbyMoney(normalizedLines, index, 2);
+    } else if (isNetInflow && values.netCashInflow === null) {
+      values.netCashInflow = findNearbyMoney(normalizedLines, index, 2);
+    } else if (isExpected && values.expectedEndingCash === null) {
+      values.expectedEndingCash = findNearbyMoney(normalizedLines, index, 2);
+    } else if (isActual && values.actualEndingCash === null) {
+      values.actualEndingCash = findNearbyMoney(normalizedLines, index, 2);
+    } else if (isDifference && values.difference === null) {
+      values.difference = findNearbyMoney(normalizedLines, index, 2);
+    }
+  }
+
+  // Fallback for receipts where OCR loses most labels but keeps the Cash Drawer block
+  // as five sequential monetary rows. Find the Cash Drawer heading and inspect the next
+  // few lines, assigning only when the sequence is strongly plausible.
+  const drawerIndex = normalizedLines.findIndex((line) =>
+    looksLike(line, ['cash', 'drawer']) || lineHasFuzzyWords(line, ['cash', 'drawer'], 2)
+  );
+
+  if (drawerIndex >= 0) {
+    const nearby = [];
+    for (let i = drawerIndex + 1; i < Math.min(normalizedLines.length, drawerIndex + 14); i += 1) {
+      const amount = extractLastMoney(normalizedLines[i]);
+      if (amount !== null) nearby.push({ index: i, amount });
+    }
+
+    // Typical order: Starting, Net inflow, Expected, Actual, Difference.
+    if (nearby.length >= 5) {
+      const seq = nearby.slice(0, 5).map((item) => item.amount);
+      const [starting, inflow, expected, actual, difference] = seq;
+      const expectedMath = starting + inflow;
+      const actualMath = expected + difference;
+      if (
+        starting >= 0 && starting < 20000 && inflow >= 0 &&
+        expected >= 4000 && actual >= 4000 && Math.abs(expectedMath - expected) <= 5 &&
+        Math.abs(actualMath - actual) <= 5
+      ) {
+        if (values.startingCash === null) values.startingCash = starting;
+        if (values.netCashInflow === null) values.netCashInflow = inflow;
+        if (values.expectedEndingCash === null) values.expectedEndingCash = expected;
+        if (values.actualEndingCash === null) values.actualEndingCash = actual;
+        if (values.difference === null) values.difference = difference;
+      }
+    }
   }
 
   return values;
@@ -291,17 +375,30 @@ async function buildOcrVariants(imageBuffer) {
   const topThreshold = await base(topSource()).threshold(178).png().toBuffer();
   const topThresholdLight = await base(topSource()).threshold(205).png().toBuffer();
 
-  const drawerTop = Math.max(0, Math.floor(height * 0.40));
-  const drawerHeight = Math.max(1, Math.min(height - drawerTop, Math.floor(height * 0.43)));
-  const drawerSource = sharp(imageBuffer).rotate().extract({ left: 0, top: drawerTop, width, height: drawerHeight });
-  const drawerNormal = await base(drawerSource).png().toBuffer();
+  // Cash Drawer position varies with receipt length (refund/credit sections add height),
+  // so OCR several overlapping middle/lower crops instead of relying on one fixed crop.
+  const drawerCrops = [
+    [0.42, 0.46],
+    [0.50, 0.42],
+    [0.58, 0.34]
+  ];
+  const drawerVariants = [];
+  for (const [topRatio, heightRatio] of drawerCrops) {
+    const cropTop = Math.max(0, Math.floor(height * topRatio));
+    const cropHeight = Math.max(1, Math.min(height - cropTop, Math.floor(height * heightRatio)));
+    const crop = () => sharp(imageBuffer).rotate().extract({ left: 0, top: cropTop, width, height: cropHeight });
+    drawerVariants.push(await base(crop()).png().toBuffer());
+    drawerVariants.push(await base(crop()).linear(1.5, -30).png().toBuffer());
+    drawerVariants.push(await base(crop()).threshold(185).png().toBuffer());
+  }
 
   const full = await base(sharp(imageBuffer)).png().toBuffer();
+  const fullThreshold = await base(sharp(imageBuffer)).threshold(188).png().toBuffer();
 
   return {
     branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
-    drawer: [drawerNormal],
-    full: [full]
+    drawer: drawerVariants,
+    full: [full, fullThreshold]
   };
 }
 
@@ -359,6 +456,8 @@ async function recognizeReceipt(imageBuffer) {
         success: false,
         reason: 'actual_ending_cash_not_found',
         branch: branchInfo.branch,
+        drawerValues,
+        drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
         text: combinedText
       };
     }
