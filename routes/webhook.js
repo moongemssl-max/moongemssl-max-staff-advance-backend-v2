@@ -8,7 +8,8 @@ const sendWhatsAppMessage = require('../services/whatsapp');
 const {
   downloadWhatsAppImage,
   recognizeReceipt,
-  buildReply
+  buildReply,
+  calculateBringAmount
 } = require('../services/shiftReceipt');
 
 const router = express.Router();
@@ -74,6 +75,18 @@ async function processShiftReceiptImage(message, senderNumber) {
 
     const replyText = buildReply(result);
     const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
+    const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
+    const processedAt = new Date();
+    const dateParts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Colombo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(processedAt).reduce((acc, part) => {
+      if (part.type !== 'literal') acc[part.type] = part.value;
+      return acc;
+    }, {});
+    const sriLankaDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
 
     await receiptRef.set(
       {
@@ -82,15 +95,32 @@ async function processShiftReceiptImage(message, senderNumber) {
         branchRaw: result.branchRaw || null,
         actualEndingCash: result.actualEndingCash,
         balance: result.balance,
+        bringAmount,
         amountSource: result.amountSource,
         drawerValues: result.drawerValues,
         replyText,
         replySent: Boolean(sendResult?.success),
         replyMessageId: sendResult?.messageId || null,
-        processedAt: new Date()
+        dateKey: sriLankaDate,
+        processedAt
       },
       { merge: true }
     );
+
+    // History used by the Android app. One document per WhatsApp receipt keeps a complete audit trail.
+    await db.collection('shift_cash_history').doc(message.id).set({
+      id: message.id,
+      whatsappMessageId: message.id,
+      senderNumber,
+      branch: result.branch,
+      branchRaw: result.branchRaw || null,
+      actualEndingCash: result.actualEndingCash,
+      removeAmount: result.balance,
+      bringAmount,
+      dateKey: sriLankaDate,
+      replyText,
+      createdAt: processedAt
+    }, { merge: true });
 
     console.log('Shift receipt processed:', message.id, replyText);
   } catch (error) {

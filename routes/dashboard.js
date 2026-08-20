@@ -76,6 +76,40 @@ router.post('/login', (req, res) => {
   });
 });
 
+
+router.get('/shift-cash-history', async (req, res) => {
+  try {
+    const date = String(req.query?.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ success: false, message: 'date must be YYYY-MM-DD' });
+    }
+
+    const snapshot = await db
+      .collection('shift_cash_history')
+      .where('dateKey', '==', date)
+      .get();
+
+    const records = snapshot.docs.map((doc) => {
+      const data = doc.data();
+      const createdAt = data.createdAt?.toDate ? data.createdAt.toDate() : data.createdAt;
+      return {
+        id: doc.id,
+        branch: data.branch || '',
+        actualEndingCash: Number(data.actualEndingCash || 0),
+        removeAmount: Number(data.removeAmount || 0),
+        bringAmount: Number(data.bringAmount || 0),
+        dateKey: data.dateKey || date,
+        createdAt: createdAt instanceof Date ? createdAt.toISOString() : null
+      };
+    }).sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+    return res.json({ success: true, date, records });
+  } catch (error) {
+    console.error('Get shift cash history error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/requests', async (_req, res) => {
   try {
     const snapshot = await db
