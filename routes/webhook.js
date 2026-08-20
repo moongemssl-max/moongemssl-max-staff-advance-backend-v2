@@ -4,6 +4,12 @@ const express = require('express');
 const { db } = require('../firebase');
 const parseAdvanceMessage = require('../services/messageParser');
 const { sendAdvanceRequestNotification } = require('../services/notifications');
+const sendWhatsAppMessage = require('../services/whatsapp');
+const {
+  downloadWhatsAppImage,
+  recognizeReceipt,
+  buildReply
+} = require('../services/shiftReceipt');
 
 const router = express.Router();
 
@@ -12,16 +18,113 @@ router.get('/', (req, res) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (
-    mode === 'subscribe' &&
-    token === process.env.VERIFY_TOKEN
-  ) {
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
     console.log('Webhook verified.');
     return res.status(200).send(challenge);
   }
 
   return res.sendStatus(403);
 });
+
+async function processShiftReceiptImage(message, senderNumber) {
+  const receiptRef = db.collection('shift_receipt_messages').doc(message.id);
+  const existing = await receiptRef.get();
+
+  // Meta can retry webhook deliveries. Never send the same automatic reply twice.
+  if (existing.exists && existing.data()?.replySent === true) {
+    console.log('Shift receipt already processed:', message.id);
+    return;
+  }
+
+  await receiptRef.set(
+    {
+      id: message.id,
+      whatsappMessageId: message.id,
+      senderNumber,
+      mediaId: message.image?.id || null,
+      status: 'processing',
+      receivedAt: new Date()
+    },
+    { merge: true }
+  );
+
+  try {
+    const imageBuffer = await downloadWhatsAppImage(message.image?.id);
+    const result = await recognizeReceipt(imageBuffer);
+
+    if (!result.success) {
+      const failureReply = 'Photo එක පැහැදිලිව නැවත එවන්න.';
+      const sendResult = await sendWhatsAppMessage(senderNumber, failureReply);
+
+      await receiptRef.set(
+        {
+          status: 'needs_clearer_photo',
+          failureReason: result.reason,
+          detectedBranch: result.branch || null,
+          replyText: failureReply,
+          replySent: Boolean(sendResult?.success),
+          processedAt: new Date()
+        },
+        { merge: true }
+      );
+
+      console.warn('Shift receipt OCR failed:', message.id, result.reason);
+      return;
+    }
+
+    const replyText = buildReply(result);
+    const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
+
+    await receiptRef.set(
+      {
+        status: 'completed',
+        branch: result.branch,
+        branchRaw: result.branchRaw || null,
+        actualEndingCash: result.actualEndingCash,
+        balance: result.balance,
+        amountSource: result.amountSource,
+        drawerValues: result.drawerValues,
+        replyText,
+        replySent: Boolean(sendResult?.success),
+        replyMessageId: sendResult?.messageId || null,
+        processedAt: new Date()
+      },
+      { merge: true }
+    );
+
+    console.log('Shift receipt processed:', message.id, replyText);
+  } catch (error) {
+    console.error('Shift receipt processing error:', message.id, error);
+
+    // Do not guess a cash value when OCR/media processing fails.
+    try {
+      const failureReply = 'Photo එක පැහැදිලිව නැවත එවන්න.';
+      const sendResult = await sendWhatsAppMessage(senderNumber, failureReply);
+      await receiptRef.set(
+        {
+          status: 'error',
+          error: error.message,
+          replyText: failureReply,
+          replySent: Boolean(sendResult?.success),
+          processedAt: new Date()
+        },
+        { merge: true }
+      );
+    } catch (replyError) {
+      await receiptRef.set(
+        {
+          status: 'error',
+          error: error.message,
+          replyError: replyError.message,
+          replySent: false,
+          processedAt: new Date()
+        },
+        { merge: true }
+      );
+      console.error('Shift receipt failure reply error:', replyError);
+    }
+  }
+}
 
 router.post('/', async (req, res) => {
   // Meta expects a quick 200 response.
@@ -40,18 +143,23 @@ router.post('/', async (req, res) => {
         const contacts = value.contacts || [];
 
         for (const message of value.messages || []) {
+          const senderNumber = message.from;
+
+          // NEW: Shift Summary photo automation. Existing text workflow below is unchanged.
+          if (message.type === 'image') {
+            await processShiftReceiptImage(message, senderNumber);
+            continue;
+          }
+
           if (message.type !== 'text') {
             continue;
           }
 
-          const senderNumber = message.from;
           const messageText = message.text?.body || '';
           const parsed = parseAdvanceMessage(messageText);
 
           const employeeName =
-            contacts.find(
-              (contact) => contact.wa_id === senderNumber
-            )?.profile?.name || 'Unknown';
+            contacts.find((contact) => contact.wa_id === senderNumber)?.profile?.name || 'Unknown';
 
           const requestData = {
             id: message.id,
@@ -60,15 +168,11 @@ router.post('/', async (req, res) => {
             employeeName,
             messageText,
             amount: parsed.amount,
-            status: parsed.isAdvanceRequest
-              ? 'pending'
-              : 'needs_review',
+            status: parsed.isAdvanceRequest ? 'pending' : 'needs_review',
             receivedAt: new Date()
           };
 
-          const requestRef = db
-            .collection('advance_requests')
-            .doc(message.id);
+          const requestRef = db.collection('advance_requests').doc(message.id);
           const existingRequest = await requestRef.get();
 
           await requestRef.set(requestData, { merge: true });
@@ -78,8 +182,7 @@ router.post('/', async (req, res) => {
           // Meta may retry the same webhook. Notify only for a genuinely new message.
           if (parsed.isAdvanceRequest && !existingRequest.exists) {
             try {
-              const notificationResult =
-                await sendAdvanceRequestNotification(requestData);
+              const notificationResult = await sendAdvanceRequestNotification(requestData);
               console.log('FCM notification result:', notificationResult);
             } catch (notificationError) {
               // Keep the WhatsApp webhook successful even if push delivery fails.
