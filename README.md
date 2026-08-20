@@ -68,3 +68,19 @@ Required Render environment variables:
 - `WHATSAPP_API_VERSION` (optional, defaults to `v22.0`)
 
 The incoming employee phone number is read from the WhatsApp webhook and saved as `senderNumber`.
+
+## WhatsApp Shift Summary photo auto-reply (v3.2.0)
+
+When an employee sends an image to the same WhatsApp Business number, the webhook now:
+
+1. Downloads the WhatsApp image.
+2. Reads the receipt using local OCR (Tesseract.js).
+3. Reads the `Branch:` line and maps `Getahetta` -> `GETAHETTA`, `Main` -> `MAIN`.
+4. Reads `Actual Ending Cash` (and cross-checks the other Cash Drawer values when possible).
+5. Calculates the remaining amount in the Rs. 4,000-4,999.99 range.
+6. Replies in the same chat, for example: `GETAHETTA - Rs. 4,920 අයින් කරන්න`.
+7. If branch/cash cannot be read safely, replies: `Photo එක පැහැදිලිව නැවත එවන්න.`
+
+Existing text-based advance-request handling remains unchanged.
+
+OCR packages are installed by the normal Render build command (`npm install`). The first OCR run after a fresh deploy can be slower because the English OCR model may need to be loaded.

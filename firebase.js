@@ -5,7 +5,6 @@ const admin = require('firebase-admin');
 function getCredential() {
   const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
 
-
   if (serviceAccountJson) {
     try {
       const serviceAccount = JSON.parse(serviceAccountJson);
