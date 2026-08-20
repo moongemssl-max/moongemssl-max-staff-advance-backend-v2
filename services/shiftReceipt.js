@@ -489,7 +489,8 @@ async function recognizeReceipt(imageBuffer) {
 }
 
 function buildReply(result) {
-  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරන්න`;
+  const remainingAmount = Math.round((Number(result.actualEndingCash) - Number(result.balance)) * 100) / 100;
+  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(remainingAmount)} දාලා රැගෙන එන්න.`;
 }
 
 module.exports = {
