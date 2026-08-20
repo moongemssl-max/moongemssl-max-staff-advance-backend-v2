@@ -18,7 +18,7 @@ app.get('/', (_req, res) => {
   return res.json({
     status: 'online',
     service: 'Staff Advance Backend',
-    version: '3.2.0-shift-receipt-auto-reply'
+    version: '3.3.0-shift-cash-history'
   });
 });
 
