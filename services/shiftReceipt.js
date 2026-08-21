@@ -287,6 +287,82 @@ function findDrawerValues(lines) {
   return values;
 }
 
+
+
+function extractStrictDifferenceFromText(text) {
+  const lines = String(text || '').split(/\r?\n/).map((line) => normalizeLine(line)).filter(Boolean);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const compact = similarityText(line);
+    const isDifference = compact.includes('difference') || fuzzyContains(line, 'difference', 2);
+    if (!isDifference) continue;
+
+    // Best case: the printed Difference label and its signed value are on the same OCR line.
+    const direct = extractLastMoney(line);
+    if (direct !== null) return direct;
+
+    // Thermal OCR can split the amount onto the immediately following line. Only accept a
+    // nearly-number-only line here so we never steal Expected/Actual Ending Cash by mistake.
+    for (let offset = 1; offset <= 2; offset += 1) {
+      const next = lines[index + offset];
+      if (!next) break;
+      const nextCompact = similarityText(next);
+      const isAnotherLabel = [
+        'startingcash', 'netcashinflow', 'expectedendingcash',
+        'actualendingcash', 'difference'
+      ].some((label) => nextCompact.includes(label));
+      if (isAnotherLabel) break;
+
+      const stripped = next.replace(/[0-9OoIl|BS,.*\s+\-]/g, '');
+      if (stripped.length > 2) continue;
+      const amount = extractLastMoney(next);
+      if (amount !== null) return amount;
+    }
+  }
+
+  return null;
+}
+
+function resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, actualEndingCash) {
+  // Read Difference independently from each OCR pass, then vote. This avoids deriving a wrong
+  // Difference from an Expected Ending Cash value that OCR may have misread.
+  const candidates = [];
+  for (const text of drawerTexts || []) {
+    const value = extractStrictDifferenceFromText(text);
+    if (value !== null && Number.isFinite(value)) candidates.push(Math.round(value * 100) / 100);
+  }
+
+  if (candidates.length) {
+    const counts = new Map();
+    for (const value of candidates) {
+      const key = value.toFixed(2);
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const topCount = ranked[0][1];
+    const topValues = ranked.filter(([, count]) => count === topCount).map(([key]) => Number(key));
+
+    // Prefer consensus across OCR variants.
+    if (topCount >= 2 || topValues.length === 1) return topValues[0];
+
+    // If variants disagree and a trustworthy Expected value exists, use it only to disambiguate
+    // the printed candidates, never to manufacture a Difference on its own.
+    if (drawerValues.expectedEndingCash !== null && Number.isFinite(actualEndingCash)) {
+      topValues.sort((a, b) =>
+        Math.abs((drawerValues.expectedEndingCash + a) - actualEndingCash) -
+        Math.abs((drawerValues.expectedEndingCash + b) - actualEndingCash)
+      );
+      return topValues[0];
+    }
+
+    return candidates[0];
+  }
+
+  // No printed Difference was read reliably. Keep it blank instead of saving a wrong number.
+  return null;
+}
+
 function chooseActualEndingCash(values) {
   const direct = values.actualEndingCash;
   const candidates = [];
@@ -499,11 +575,10 @@ async function recognizeReceipt(imageBuffer) {
       };
     }
 
-    // Difference logic restored to the previously working Phase 7 behavior.
-    // Prefer Actual - Expected when Expected Ending Cash was read; otherwise keep the OCR Difference value.
-    const resolvedDifference = drawerValues.expectedEndingCash !== null
-      ? Math.round((chosen.amount - drawerValues.expectedEndingCash) * 100) / 100
-      : drawerValues.difference;
+    // Difference is taken from the printed Difference row only. We deliberately do not
+    // calculate it from Expected Ending Cash because a single OCR error there can create a
+    // confident-looking but wrong Difference value.
+    const resolvedDifference = resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
 
     return {
       success: true,
