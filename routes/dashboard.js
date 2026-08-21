@@ -98,6 +98,8 @@ router.get('/shift-cash-history', async (req, res) => {
         actualEndingCash: Number(data.actualEndingCash || 0),
         removeAmount: Number(data.removeAmount || 0),
         bringAmount: Number(data.bringAmount || 0),
+        difference: data.difference == null ? null : Number(data.difference),
+        ocrMode: data.ocrMode || null,
         dateKey: data.dateKey || date,
         createdAt: createdAt instanceof Date ? createdAt.toISOString() : null
       };

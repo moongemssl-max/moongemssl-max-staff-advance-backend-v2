@@ -97,6 +97,8 @@ async function processShiftReceiptImage(message, senderNumber) {
         balance: result.balance,
         bringAmount,
         amountSource: result.amountSource,
+        difference: result.difference ?? result.drawerValues?.difference ?? null,
+        ocrMode: result.ocrMode || null,
         drawerValues: result.drawerValues,
         replyText,
         replySent: Boolean(sendResult?.success),
@@ -117,6 +119,8 @@ async function processShiftReceiptImage(message, senderNumber) {
       actualEndingCash: result.actualEndingCash,
       removeAmount: result.balance,
       bringAmount,
+      difference: result.difference ?? result.drawerValues?.difference ?? null,
+      ocrMode: result.ocrMode || null,
       dateKey: sriLankaDate,
       replyText,
       createdAt: processedAt
