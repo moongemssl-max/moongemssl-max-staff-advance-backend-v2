@@ -3,6 +3,28 @@
 const sharp = require('sharp');
 const { createWorker } = require('tesseract.js');
 
+// Keep one OCR worker warm between WhatsApp photos. Creating/terminating a Tesseract
+// worker for every receipt is expensive and was the biggest avoidable delay.
+let sharedWorkerPromise = null;
+let ocrQueue = Promise.resolve();
+
+async function getSharedWorker() {
+  if (!sharedWorkerPromise) {
+    sharedWorkerPromise = createWorker('eng').catch((error) => {
+      sharedWorkerPromise = null;
+      throw error;
+    });
+  }
+  return sharedWorkerPromise;
+}
+
+function runOcrExclusive(task) {
+  const run = ocrQueue.then(task, task);
+  // Keep the queue alive even if one receipt fails.
+  ocrQueue = run.catch(() => undefined);
+  return run;
+}
+
 function normalizeNumberToken(value) {
   return String(value || '')
     .replace(/[Oo]/g, '0')
@@ -353,6 +375,23 @@ async function downloadWhatsAppImage(mediaId) {
   return buffer;
 }
 
+async function buildFastOcrImage(imageBuffer) {
+  // One lightweight whole-receipt pass handles clear photos. Only if this fails do
+  // we run the slower multi-crop/multi-threshold fallback below.
+  const metadata = await sharp(imageBuffer).rotate().metadata();
+  const width = metadata.width || 1200;
+  const targetWidth = Math.min(Math.max(Math.round(width * 1.7), 1500), 2200);
+
+  return sharp(imageBuffer)
+    .rotate()
+    .grayscale()
+    .normalize()
+    .sharpen({ sigma: 1.1 })
+    .resize({ width: targetWidth, withoutEnlargement: false })
+    .png()
+    .toBuffer();
+}
+
 async function buildOcrVariants(imageBuffer) {
   const metadata = await sharp(imageBuffer).rotate().metadata();
   const width = metadata.width || 1200;
@@ -417,14 +456,48 @@ async function recognizeVariants(worker, variants, pageSegMode) {
 }
 
 async function recognizeReceipt(imageBuffer) {
-  const worker = await createWorker('eng');
-  try {
-    const variants = await buildOcrVariants(imageBuffer);
+  return runOcrExclusive(async () => {
+    const worker = await getSharedWorker();
 
-    // PSM 6 works much better for the small, single receipt block at the top/drawer.
+    // FAST PATH: one OCR pass on a clean, resized whole receipt.
+    try {
+      const fastImage = await buildFastOcrImage(imageBuffer);
+      await worker.setParameters({
+        tessedit_pageseg_mode: '6',
+        preserve_interword_spaces: '1'
+      });
+      const fastResult = await worker.recognize(fastImage);
+      const fastText = fastResult?.data?.text || '';
+      const fastLines = fastText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const fastBranch = extractBranch(fastLines);
+      const fastDrawerValues = findDrawerValues(fastLines);
+      const fastChosen = chooseActualEndingCash(fastDrawerValues);
+
+      if (fastBranch.branch && fastChosen.amount !== null) {
+        const fastBalance = calculateBalance(fastChosen.amount);
+        if (fastBalance >= 4000 && fastBalance < 5000) {
+          return {
+            success: true,
+            branch: fastBranch.branch,
+            branchRaw: fastBranch.branchRaw,
+            actualEndingCash: fastChosen.amount,
+            balance: fastBalance,
+            difference: fastDrawerValues.difference,
+            amountSource: `fast_${fastChosen.source}`,
+            drawerValues: fastDrawerValues,
+            text: fastText,
+            ocrMode: 'fast'
+          };
+        }
+      }
+    } catch (fastError) {
+      console.warn('Fast receipt OCR pass failed; using safe fallback:', fastError.message);
+    }
+
+    // SAFE FALLBACK: existing strong Phase 3/5 multi-pass OCR for difficult photos.
+    const variants = await buildOcrVariants(imageBuffer);
     const branchTexts = await recognizeVariants(worker, variants.branch, 6);
     const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
-    // PSM 3 is kept as a general fallback for the whole receipt.
     const fullTexts = await recognizeVariants(worker, variants.full, 3);
 
     const branchText = branchTexts.join('\n');
@@ -435,7 +508,6 @@ async function recognizeReceipt(imageBuffer) {
     const branchLines = branchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const allLines = combinedText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
-    // Branch is resolved from the dedicated top crop first, then all OCR text as fallback.
     let branchInfo = extractBranch(branchLines);
     if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
@@ -447,7 +519,8 @@ async function recognizeReceipt(imageBuffer) {
         success: false,
         reason: 'branch_not_found',
         text: combinedText,
-        branchOcrPreview: branchLines.slice(0, 12).join(' | ')
+        branchOcrPreview: branchLines.slice(0, 12).join(' | '),
+        ocrMode: 'fallback'
       };
     }
 
@@ -458,7 +531,8 @@ async function recognizeReceipt(imageBuffer) {
         branch: branchInfo.branch,
         drawerValues,
         drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
-        text: combinedText
+        text: combinedText,
+        ocrMode: 'fallback'
       };
     }
 
@@ -469,7 +543,8 @@ async function recognizeReceipt(imageBuffer) {
         reason: 'balance_out_of_range',
         branch: branchInfo.branch,
         actualEndingCash: chosen.amount,
-        text: combinedText
+        text: combinedText,
+        ocrMode: 'fallback'
       };
     }
 
@@ -479,13 +554,13 @@ async function recognizeReceipt(imageBuffer) {
       branchRaw: branchInfo.branchRaw,
       actualEndingCash: chosen.amount,
       balance,
+      difference: drawerValues.difference,
       amountSource: chosen.source,
       drawerValues,
-      text: combinedText
+      text: combinedText,
+      ocrMode: 'fallback'
     };
-  } finally {
-    await worker.terminate();
-  }
+  });
 }
 
 function calculateBringAmount(actualEndingCash, balance) {
@@ -494,7 +569,7 @@ function calculateBringAmount(actualEndingCash, balance) {
 
 function buildReply(result) {
   const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
-  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} රැගෙන එන්න.`;
+  return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} බාර දෙන්න.`;
 }
 
 module.exports = {
