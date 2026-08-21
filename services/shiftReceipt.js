@@ -499,9 +499,16 @@ async function recognizeReceipt(imageBuffer) {
       };
     }
 
-    const resolvedDifference = drawerValues.expectedEndingCash !== null
-      ? Math.round((chosen.amount - drawerValues.expectedEndingCash) * 100) / 100
-      : drawerValues.difference;
+    // Resolve Difference with multiple safe drawer-math fallbacks.
+    // Some receipts OCR the Actual line correctly but miss the printed Difference/Expected line.
+    // In that case Starting Cash + Net Cash Inflow is the same Expected Ending Cash shown on the receipt.
+    let resolvedDifference = drawerValues.difference;
+    if (drawerValues.expectedEndingCash !== null) {
+      resolvedDifference = Math.round((chosen.amount - drawerValues.expectedEndingCash) * 100) / 100;
+    } else if (drawerValues.startingCash !== null && drawerValues.netCashInflow !== null) {
+      const derivedExpected = drawerValues.startingCash + drawerValues.netCashInflow;
+      resolvedDifference = Math.round((chosen.amount - derivedExpected) * 100) / 100;
+    }
 
     return {
       success: true,
