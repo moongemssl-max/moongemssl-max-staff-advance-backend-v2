@@ -620,6 +620,7 @@ async function recognizeReceipt(imageBuffer) {
       difference: resolvedDifference,
       amountSource: chosen.source,
       drawerValues,
+      payInOutText: fullTexts[0] || fullText || combinedText,
       text: combinedText
     };
   });
@@ -634,11 +635,99 @@ function buildReply(result) {
   return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} බාර දෙන්න.`;
 }
 
+
+function normalizeReasonKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/0/g, 'o')
+    .replace(/1/g, 'l')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function reasonMatchesLine(line, reason) {
+  const lineKey = normalizeReasonKey(line);
+  const reasonKey = normalizeReasonKey(reason);
+  if (!lineKey || !reasonKey) return false;
+  if (lineKey.includes(reasonKey)) return true;
+  // Only allow fuzzy matching for reasonably distinctive reason names.
+  return reasonKey.length >= 5 && fuzzyContains(line, reason, Math.min(2, Math.floor(reasonKey.length / 5) + 1));
+}
+
+function detectPayDirection(line, amount) {
+  const text = String(line || '').toLowerCase();
+  if (/\b(out|payout|pay\s*out)\b/.test(text)) return 'OUT';
+  if (/\b(in|payin|pay\s*in)\b/.test(text)) return 'IN';
+  if (Number(amount) < 0) return 'OUT';
+  return 'IN';
+}
+
+function extractPayInOutItems(text, reasons = []) {
+  const configured = Array.from(new Set((reasons || [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)));
+  if (!configured.length) return [];
+
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => normalizeLine(line))
+    .filter(Boolean);
+
+  const found = [];
+  const seen = new Set();
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lineKey = normalizeReasonKey(line);
+
+    // Exact configured names always win. This is important for intentionally separate names
+    // such as "Poltel" and "Petrol", which are too similar for a blind fuzzy match.
+    let matches = configured.filter((reason) => lineKey.includes(normalizeReasonKey(reason)));
+    if (!matches.length) {
+      const fuzzy = configured.filter((reason) => reasonMatchesLine(line, reason));
+      // If OCR makes two configured names equally plausible, skip instead of categorising wrongly.
+      if (fuzzy.length === 1) matches = fuzzy;
+    }
+    if (!matches.length) continue;
+
+    const reason = matches.sort((a, b) => normalizeReasonKey(b).length - normalizeReasonKey(a).length)[0];
+    let amount = extractLastMoney(line);
+    let sourceLine = line;
+    if (amount === null) {
+      // Some thermal receipts split reason and amount/type onto the next line.
+      for (const nextIndex of [index + 1, index - 1]) {
+        if (nextIndex < 0 || nextIndex >= lines.length) continue;
+        const candidate = lines[nextIndex];
+        const candidateKey = normalizeReasonKey(candidate);
+        if (configured.some((other) => other !== reason && candidateKey.includes(normalizeReasonKey(other)))) continue;
+        const candidateAmount = extractLastMoney(candidate);
+        if (candidateAmount !== null) {
+          amount = candidateAmount;
+          sourceLine = `${line} ${candidate}`;
+          break;
+        }
+      }
+    }
+    if (amount === null || !Number.isFinite(amount) || amount === 0) continue;
+
+    const type = detectPayDirection(sourceLine, amount);
+    const absoluteAmount = Math.round(Math.abs(Number(amount)) * 100) / 100;
+    if (absoluteAmount <= 0 || absoluteAmount > 1000000) continue;
+
+    const key = `${index}:${normalizeReasonKey(reason)}:${absoluteAmount.toFixed(2)}:${type}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push({ reason, amount: absoluteAmount, type });
+  }
+
+  return found;
+}
+
 module.exports = {
   downloadWhatsAppImage,
   recognizeReceipt,
   calculateBalance,
   calculateBringAmount,
   buildReply,
-  formatMoney
+  formatMoney,
+  extractPayInOutItems
 };
