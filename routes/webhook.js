@@ -9,10 +9,37 @@ const {
   downloadWhatsAppImage,
   recognizeReceipt,
   buildReply,
-  calculateBringAmount
+  calculateBringAmount,
+  extractPayInOutItems
 } = require('../services/shiftReceipt');
 
 const router = express.Router();
+
+
+const DEFAULT_PAY_IN_OUT_REASONS = [
+  'Hadunkuru',
+  'Poltel',
+  'Petrol',
+  'Adu',
+  'Wedi',
+  'Battry',
+  'Bill Payment',
+  'Rusiru Advance',
+  'Prasanna Advance',
+  'Nandasena Advance'
+];
+
+async function getPayInOutReasons() {
+  try {
+    const doc = await db.collection('app_settings').doc('pay_in_out_reasons').get();
+    const values = doc.exists && Array.isArray(doc.data()?.reasons) ? doc.data().reasons : [];
+    const cleaned = values.map((value) => String(value || '').trim()).filter(Boolean);
+    return cleaned.length ? cleaned : DEFAULT_PAY_IN_OUT_REASONS;
+  } catch (error) {
+    console.warn('Could not load Pay In/Out reasons, using defaults:', error.message);
+    return DEFAULT_PAY_IN_OUT_REASONS;
+  }
+}
 
 router.get('/', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -73,6 +100,8 @@ async function processShiftReceiptImage(message, senderNumber) {
       return;
     }
 
+    const reasons = await getPayInOutReasons();
+    const payInOutItems = extractPayInOutItems(result.payInOutText || result.text, reasons);
     const replyText = buildReply(result);
     const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
     const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
@@ -100,6 +129,7 @@ async function processShiftReceiptImage(message, senderNumber) {
         difference: result.difference ?? result.drawerValues?.difference ?? null,
         ocrMode: result.ocrMode || null,
         drawerValues: result.drawerValues,
+        payInOutItems,
         replyText,
         replySent: Boolean(sendResult?.success),
         replyMessageId: sendResult?.messageId || null,
@@ -120,13 +150,14 @@ async function processShiftReceiptImage(message, senderNumber) {
       removeAmount: result.balance,
       bringAmount,
       difference: result.difference ?? result.drawerValues?.difference ?? null,
+      payInOutItems,
       ocrMode: result.ocrMode || null,
       dateKey: sriLankaDate,
       replyText,
       createdAt: processedAt
     }, { merge: true });
 
-    console.log('Shift receipt processed:', message.id, replyText);
+    console.log('Shift receipt processed:', message.id, replyText, 'PayIn/Out:', payInOutItems);
   } catch (error) {
     console.error('Shift receipt processing error:', message.id, error);
 

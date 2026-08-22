@@ -77,6 +77,117 @@ router.post('/login', (req, res) => {
 });
 
 
+
+const DEFAULT_PAY_IN_OUT_REASONS = [
+  'Hadunkuru', 'Poltel', 'Petrol', 'Adu', 'Wedi', 'Battry', 'Bill Payment',
+  'Rusiru Advance', 'Prasanna Advance', 'Nandasena Advance'
+];
+
+function cleanReasons(values) {
+  const seen = new Set();
+  const result = [];
+  for (const raw of Array.isArray(values) ? values : []) {
+    const value = String(raw || '').trim().replace(/\s+/g, ' ');
+    if (!value || value.length > 40) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+router.get('/pay-in-out-reasons', async (_req, res) => {
+  try {
+    const ref = db.collection('app_settings').doc('pay_in_out_reasons');
+    const doc = await ref.get();
+    let reasons = doc.exists ? cleanReasons(doc.data()?.reasons) : [];
+    if (!reasons.length) {
+      reasons = DEFAULT_PAY_IN_OUT_REASONS;
+      await ref.set({ reasons, updatedAt: new Date() }, { merge: true });
+    }
+    return res.json({ success: true, reasons });
+  } catch (error) {
+    console.error('Get Pay In/Out reasons error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.put('/pay-in-out-reasons', async (req, res) => {
+  try {
+    const reasons = cleanReasons(req.body?.reasons);
+    if (!reasons.length) {
+      return res.status(400).json({ success: false, message: 'At least one reason is required.' });
+    }
+    if (reasons.length > 50) {
+      return res.status(400).json({ success: false, message: 'Maximum 50 reasons are allowed.' });
+    }
+    await db.collection('app_settings').doc('pay_in_out_reasons').set({
+      reasons,
+      updatedAt: new Date()
+    }, { merge: true });
+    return res.json({ success: true, reasons });
+  } catch (error) {
+    console.error('Save Pay In/Out reasons error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.get('/pay-in-out-summary', async (req, res) => {
+  try {
+    const month = String(req.query?.month || '').trim();
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ success: false, message: 'month must be YYYY-MM' });
+    }
+    const start = `${month}-01`;
+    const [year, monthNumber] = month.split('-').map(Number);
+    const nextMonth = new Date(Date.UTC(year, monthNumber, 1));
+    const nextKey = `${nextMonth.getUTCFullYear()}-${String(nextMonth.getUTCMonth() + 1).padStart(2, '0')}-01`;
+
+    const snapshot = await db.collection('shift_cash_history')
+      .where('dateKey', '>=', start)
+      .where('dateKey', '<', nextKey)
+      .get();
+
+    const buckets = new Map();
+    function add(branch, item) {
+      const b = String(branch || '').toUpperCase();
+      if (!['MAIN', 'GETAHETTA'].includes(b)) return;
+      const reason = String(item?.reason || '').trim();
+      const type = String(item?.type || '').toUpperCase() === 'IN' ? 'IN' : 'OUT';
+      const amount = Number(item?.amount || 0);
+      if (!reason || !Number.isFinite(amount) || amount <= 0) return;
+      const key = `${b}\u0000${reason.toLowerCase()}\u0000${type}`;
+      const current = buckets.get(key) || { branch: b, reason, type, total: 0, count: 0 };
+      current.total = Math.round((current.total + amount) * 100) / 100;
+      current.count += 1;
+      buckets.set(key, current);
+    }
+
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      for (const item of Array.isArray(data.payInOutItems) ? data.payInOutItems : []) add(data.branch, item);
+    }
+
+    const items = [...buckets.values()].sort((a, b) =>
+      a.branch.localeCompare(b.branch) || a.reason.localeCompare(b.reason) || a.type.localeCompare(b.type)
+    );
+    const branchTotals = {};
+    for (const branch of ['MAIN', 'GETAHETTA']) {
+      const rows = items.filter((item) => item.branch === branch);
+      branchTotals[branch] = {
+        inTotal: Math.round(rows.filter((i) => i.type === 'IN').reduce((sum, i) => sum + i.total, 0) * 100) / 100,
+        outTotal: Math.round(rows.filter((i) => i.type === 'OUT').reduce((sum, i) => sum + i.total, 0) * 100) / 100
+      };
+    }
+
+    return res.json({ success: true, month, items, branchTotals });
+  } catch (error) {
+    console.error('Get Pay In/Out summary error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.get('/shift-cash-history', async (req, res) => {
   try {
     const date = String(req.query?.date || '').trim();
@@ -99,6 +210,11 @@ router.get('/shift-cash-history', async (req, res) => {
         removeAmount: Number(data.removeAmount || 0),
         bringAmount: Number(data.bringAmount || 0),
         difference: data.difference == null ? null : Number(data.difference),
+        payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems.map((item) => ({
+          reason: String(item.reason || ''),
+          amount: Number(item.amount || 0),
+          type: String(item.type || '').toUpperCase() === 'IN' ? 'IN' : 'OUT'
+        })) : [],
         ocrMode: data.ocrMode || null,
         dateKey: data.dateKey || date,
         createdAt: createdAt instanceof Date ? createdAt.toISOString() : null
