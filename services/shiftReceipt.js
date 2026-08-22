@@ -363,11 +363,42 @@ function resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, actualEndi
   return null;
 }
 
+function normalizeActualEndingCashCandidate(value) {
+  if (value === null || !Number.isFinite(value)) return null;
+
+  const rounded = Math.round(Number(value) * 100) / 100;
+  if (rounded < 4000) return null;
+
+  // Thermal-receipt OCR can occasionally join the printed amount with stray digits from the
+  // Difference/next row (example: 65,940.00 becomes 65,940,005). When the raw number is
+  // implausibly large, try removing only trailing OCR digits by powers of ten and accept a
+  // recovered value only when it satisfies the app's proven Rs. 4,000-5,000 remainder rule.
+  if (rounded >= 2000000) {
+    // The failure seen on these receipts is normally an amount such as 65,940.00 with
+    // three stray OCR digits appended (for example 65,940,005). Try stripping three
+    // trailing digits first, then progressively looser fallbacks. Use integer truncation
+    // so 65,940,005 becomes 65,940 rather than 65,940.01.
+    for (const power of [3, 2, 1, 4, 5]) {
+      const recovered = Math.trunc(rounded / (10 ** power));
+      if (recovered < 4000 || recovered >= 2000000) continue;
+      const remainder = calculateBalance(recovered);
+      if (remainder >= 4000 && remainder < 5000) return recovered;
+    }
+    return null;
+  }
+
+  return rounded;
+}
+
 function chooseActualEndingCash(values) {
-  const direct = values.actualEndingCash;
+  const rawDirect = values.actualEndingCash;
+  const direct = normalizeActualEndingCashCandidate(rawDirect);
   const candidates = [];
 
-  if (direct !== null && direct >= 4000) candidates.push({ value: direct, source: 'actual_ending_cash' });
+  if (direct !== null) candidates.push({
+    value: direct,
+    source: rawDirect !== direct ? 'actual_ending_cash_recovered' : 'actual_ending_cash'
+  });
 
   if (values.expectedEndingCash !== null && values.difference !== null) {
     candidates.push({
