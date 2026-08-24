@@ -390,6 +390,45 @@ function normalizeActualEndingCashCandidate(value) {
   return rounded;
 }
 
+function extractActualEndingCashFromText(text) {
+  const lines = String(text || '').split(/\r?\n/).map((line) => normalizeLine(line)).filter(Boolean);
+  const candidates = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const isActual =
+      lineHasFuzzyWords(line, ['actual', 'ending', 'cash'], 3) ||
+      (fuzzyContains(line, 'actual', 3) && fuzzyContains(line, 'cash', 2)) ||
+      /act[a-z0-9 ]{0,8}end[a-z0-9 ]{0,8}cash/i.test(line);
+    if (!isActual) continue;
+
+    const direct = extractLastMoney(line);
+    if (direct !== null) candidates.push(direct);
+
+    // Amount is sometimes placed on the next OCR line by Tesseract.
+    for (let offset = 1; offset <= 2; offset += 1) {
+      const next = lines[index + offset];
+      if (!next) break;
+      if (lineHasFuzzyWords(next, ['difference'], 3)) break;
+      const value = extractLastMoney(next);
+      if (value !== null) candidates.push(value);
+    }
+  }
+
+  const cleaned = candidates
+    .map(normalizeActualEndingCashCandidate)
+    .filter((value) => value !== null && value >= 4000 && value < 2000000);
+  if (!cleaned.length) return null;
+
+  // Vote after rounding to cents. Multiple preprocessing passes normally agree on a clear receipt.
+  const counts = new Map();
+  for (const value of cleaned) {
+    const key = Number(value).toFixed(2);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return Number([...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+}
+
 function chooseActualEndingCash(values) {
   const rawDirect = values.actualEndingCash;
   const direct = normalizeActualEndingCashCandidate(rawDirect);
@@ -526,12 +565,14 @@ async function buildOcrVariants(imageBuffer) {
   }
 
   const full = await base(sharp(imageBuffer)).png().toBuffer();
+  const fullHighContrast = await base(sharp(imageBuffer)).linear(1.45, -25).png().toBuffer();
   const fullThreshold = await base(sharp(imageBuffer)).threshold(188).png().toBuffer();
+  const fullThresholdLight = await base(sharp(imageBuffer)).threshold(205).png().toBuffer();
 
   return {
     branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
     drawer: drawerVariants,
-    full: [full, fullThreshold]
+    full: [full, fullHighContrast, fullThreshold, fullThresholdLight]
   };
 }
 
@@ -558,7 +599,9 @@ async function recognizeReceipt(imageBuffer) {
     const branchTexts = await recognizeVariants(worker, variants.branch, 6);
     const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
     // PSM 3 is kept as a general fallback for the whole receipt.
-    const fullTexts = await recognizeVariants(worker, variants.full, 3);
+    const fullTextsPsm3 = await recognizeVariants(worker, variants.full, 3);
+    const fullTextsPsm6 = await recognizeVariants(worker, variants.full, 6);
+    const fullTexts = [...fullTextsPsm3, ...fullTextsPsm6];
 
     const branchText = branchTexts.join('\n');
     const drawerText = drawerTexts.join('\n');
@@ -573,7 +616,25 @@ async function recognizeReceipt(imageBuffer) {
     if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
     const drawerValues = findDrawerValues(allLines);
-    const chosen = chooseActualEndingCash(drawerValues);
+    let chosen = chooseActualEndingCash(drawerValues);
+
+    // Strong fallback: independently read the labelled Actual Ending Cash row from every OCR pass.
+    // This prevents a clear receipt being rejected merely because the generic drawer parser missed one label.
+    if (chosen.amount === null) {
+      const directCandidates = [...drawerTexts, ...fullTexts]
+        .map(extractActualEndingCashFromText)
+        .filter((value) => value !== null);
+      if (directCandidates.length) {
+        const counts = new Map();
+        for (const value of directCandidates) {
+          const key = Number(value).toFixed(2);
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+        const best = Number([...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+        chosen = { amount: best, source: 'labelled_actual_ending_cash_fallback' };
+        drawerValues.actualEndingCash = best;
+      }
+    }
 
     if (!branchInfo.branch) {
       return {
@@ -596,15 +657,6 @@ async function recognizeReceipt(imageBuffer) {
     }
 
     const balance = calculateBalance(chosen.amount);
-    if (!(balance >= 4000 && balance < 5000)) {
-      return {
-        success: false,
-        reason: 'balance_out_of_range',
-        branch: branchInfo.branch,
-        actualEndingCash: chosen.amount,
-        text: combinedText
-      };
-    }
 
     // Difference is taken from the printed Difference row only. We deliberately do not
     // calculate it from Expected Ending Cash because a single OCR error there can create a

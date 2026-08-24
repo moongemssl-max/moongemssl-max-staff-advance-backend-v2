@@ -81,14 +81,21 @@ async function processShiftReceiptImage(message, senderNumber) {
     const result = await recognizeReceipt(imageBuffer);
 
     if (!result.success) {
-      const failureReply = 'Photo එක පැහැදිලිව නැවත එවන්න.';
+      // Do not incorrectly tell the employee that a visibly clear photo is unclear.
+      // Tell them exactly which printed field could not be read so a retry can be framed correctly.
+      const failureReply = result.reason === 'branch_not_found'
+        ? 'Receipt එකේ Branch නම read වුණේ නැහැ. Branch සහ Shift Summary header එක පේන විදිහට photo එක නැවත එවන්න.'
+        : 'Receipt එකේ Actual Ending Cash value එක read වුණේ නැහැ. Cash Drawer කොටස පේන විදිහට photo එක නැවත එවන්න.';
       const sendResult = await sendWhatsAppMessage(senderNumber, failureReply);
 
       await receiptRef.set(
         {
-          status: 'needs_clearer_photo',
+          status: 'needs_review',
           failureReason: result.reason,
           detectedBranch: result.branch || null,
+          drawerValues: result.drawerValues || null,
+          branchOcrPreview: result.branchOcrPreview || null,
+          drawerOcrPreview: result.drawerOcrPreview || null,
           replyText: failureReply,
           replySent: Boolean(sendResult?.success),
           processedAt: new Date()
