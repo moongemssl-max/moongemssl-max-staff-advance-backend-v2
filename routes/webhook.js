@@ -190,7 +190,7 @@ async function saveCompletedShift(data, currentMessageId, senderNumber) {
     drawerValues: data.drawerValues || null,
     payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems : [],
     payInOutTotals: data.payTotals || null,
-    ocrMode: 'phase20_field_recovery',
+    ocrMode: 'phase26_final_field_recovery',
     dateKey: sriLankaDate,
     replyText,
     replySent: Boolean(sendResult?.success),
@@ -254,11 +254,7 @@ async function processShiftReceiptImage(message, senderNumber) {
       } else if (field === 'pay_totals' && partial.success) {
         merged.payTotals = { ...(merged.payTotals || {}), ...(partial.totals || {}) };
       } else if (field === 'pay_line' && partial.success) {
-        merged.payInOutItems = chooseBestPayItems(
-          merged.payInOutItems || [],
-          partial.items || [],
-          merged.payTotals || null
-        );
+        merged.payInOutItems = Array.isArray(partial.items) ? partial.items : [];
       }
 
       if (
@@ -281,7 +277,16 @@ async function processShiftReceiptImage(message, senderNumber) {
         merged.payInOutItems = reconciledPay.items;
       }
 
-      const next = requiredField(merged);
+      let next = requiredField(merged);
+      if (
+        field === 'pay_line' &&
+        merged.payTotals?.count != null &&
+        Array.isArray(merged.payInOutItems) &&
+        merged.payInOutItems.length === Number(merged.payTotals.count) &&
+        next === 'pay_line'
+      ) {
+        next = null;
+      }
       if (next === field) {
         const reply = `ඒ value එක තවම හරියට read වුණේ නැහැ. ${fieldPrompt(field, merged)}`;
         await sendWhatsAppMessage(senderNumber, reply);
