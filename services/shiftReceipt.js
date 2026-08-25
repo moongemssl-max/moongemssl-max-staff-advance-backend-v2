@@ -1027,7 +1027,8 @@ function detectPayDirection(line, amount) {
 }
 
 function extractPayInOutItems(text, configuredReasons = []) {
-  // Do NOT normalize away "(" and ")" before checking the transaction marker.
+  // Keep raw OCR punctuation until AFTER we detect the transaction marker.
+  // normalizeLine() removes "(" and ")", so using it first breaks "(IN)/(OUT)" parsing.
   const rawLines = String(text || '')
     .split(/\r?\n/)
     .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
@@ -1070,13 +1071,15 @@ function extractPayInOutItems(text, configuredReasons = []) {
   }
 
   for (const rawLine of rawLines) {
-    // Only transaction rows beginning with IN/OUT are allowed.
-    // Brackets are preferred but OCR may drop one of them.
-    const match = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
-    if (!match) continue;
+    // Transaction rows only.
+    // Printed form is "(IN) Reason 123.00" or "(OUT) Reason 123.00".
+    // OCR can lose a bracket, therefore accept only a LEADING IN/OUT marker.
+    // Summary rows such as Total Payin / Total Payout / Net Inflow can never match this.
+    const marker = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
+    if (!marker) continue;
 
-    const type = match[1].toUpperCase();
-    const remainder = match[2].trim();
+    const type = marker[1].toUpperCase();
+    const remainder = marker[2].trim();
     const amount = extractLastMoney(remainder);
 
     if (amount === null || !Number.isFinite(Number(amount))) continue;
