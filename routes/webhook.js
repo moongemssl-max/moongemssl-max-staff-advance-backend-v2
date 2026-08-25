@@ -10,7 +10,9 @@ const {
   recognizeReceipt,
   buildReply,
   calculateBringAmount,
-  extractPayInOutItems
+  extractPayInOutItems,
+  recognizeReceiptSection,
+  inspectPayInOutSection
 } = require('../services/shiftReceipt');
 
 const router = express.Router();
@@ -54,145 +56,280 @@ router.get('/', (req, res) => {
   return res.sendStatus(403);
 });
 
-async function processShiftReceiptImage(message, senderNumber) {
-  const receiptRef = db.collection('shift_receipt_messages').doc(message.id);
-  const existing = await receiptRef.get();
+const SESSION_TTL_MS = 45 * 60 * 1000;
 
-  // Meta can retry webhook deliveries. Never send the same automatic reply twice.
-  if (existing.exists && existing.data()?.replySent === true) {
-    console.log('Shift receipt already processed:', message.id);
-    return;
+function sessionDocId(senderNumber) {
+  return String(senderNumber || '').replace(/\D/g, '').slice(-15) || 'unknown';
+}
+
+function nextMissingSection(data) {
+  if (!data?.branch) return 'branch';
+  if (!Number.isFinite(Number(data?.actualEndingCash))) return 'cash_drawer';
+  if (data?.payInOutVerified !== true) return 'pay_in_out';
+  return null;
+}
+
+function sectionPrompt(section) {
+  if (section === 'branch') {
+    return 'Branch එක විතරක් තව පැහැදිලි නැහැ. Receipt එකේ උඩ තියෙන Branch / Shift Summary කොටස විතරක් ලඟින් photo එකක් එවන්න.';
   }
+  if (section === 'cash_drawer') {
+    return 'Cash Drawer එක විතරක් තව verify කරන්න ඕන. Starting Cash සිට Difference දක්වා Cash Drawer කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+  }
+  if (section === 'pay_in_out') {
+    return 'Pay In / Pay Out එක විතරක් තව verify කරන්න ඕන. Receipt එකේ Payin/Payout කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+  }
+  return 'අවශ්‍ය කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+}
 
-  await receiptRef.set(
-    {
-      id: message.id,
-      whatsappMessageId: message.id,
-      senderNumber,
-      mediaId: message.image?.id || null,
-      status: 'processing',
-      receivedAt: new Date()
-    },
+async function loadActiveShiftSession(senderNumber) {
+  const ref = db.collection('shift_receipt_sessions').doc(sessionDocId(senderNumber));
+  const snap = await ref.get();
+  if (!snap.exists) return { ref, data: null };
+
+  const data = snap.data() || {};
+  const updatedAt = data.updatedAt?.toDate?.() || data.createdAt?.toDate?.() || null;
+  if (data.status === 'completed' || (updatedAt && Date.now() - updatedAt.getTime() > SESSION_TTL_MS)) {
+    await ref.delete().catch(() => undefined);
+    return { ref, data: null };
+  }
+  return { ref, data };
+}
+
+async function saveCompletedShift(data, currentMessageId, senderNumber) {
+  const rootMessageId = data.rootMessageId || currentMessageId;
+  const branch = data.branch;
+  const actualEndingCash = Number(data.actualEndingCash);
+  // Existing StaffAdvance rule: calculateBalance() is the amount the employee removes
+  // (normally Rs. 4,000–4,999.99); the rest is handed over.
+  const removeAmount = calculateBalance(actualEndingCash);
+  if (!(removeAmount >= 4000 && removeAmount < 5000)) {
+    throw new Error(`Shift cash safety check failed: ${removeAmount}`);
+  }
+  const bringAmount = calculateBringAmount(actualEndingCash, removeAmount);
+
+  const resultForReply = {
+    branch,
+    actualEndingCash,
+    balance: removeAmount
+  };
+  const replyText = buildReply(resultForReply);
+  const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
+  const processedAt = new Date();
+
+  const dateParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Colombo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(processedAt).reduce((acc, part) => {
+    if (part.type !== 'literal') acc[part.type] = part.value;
+    return acc;
+  }, {});
+  const sriLankaDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+
+  const record = {
+    id: rootMessageId,
+    whatsappMessageId: rootMessageId,
+    senderNumber,
+    branch,
+    branchRaw: data.branchRaw || null,
+    actualEndingCash,
+    removeAmount,
+    balance: removeAmount,
+    bringAmount,
+    difference: data.difference ?? data.drawerValues?.difference ?? null,
+    drawerValues: data.drawerValues || null,
+    payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems : [],
+    ocrMode: 'phase19_section_retry',
+    dateKey: sriLankaDate,
+    replyText,
+    replySent: Boolean(sendResult?.success),
+    replyMessageId: sendResult?.messageId || null,
+    createdAt: processedAt
+  };
+
+  await db.collection('shift_cash_history').doc(rootMessageId).set(record, { merge: true });
+  await db.collection('shift_receipt_messages').doc(rootMessageId).set(
+    { ...record, status: 'completed', processedAt },
     { merge: true }
   );
 
+  return { replyText, bringAmount, removeAmount };
+}
+
+async function processShiftReceiptImage(message, senderNumber) {
+  const currentReceiptRef = db.collection('shift_receipt_messages').doc(message.id);
+  const { ref: sessionRef, data: existingSession } = await loadActiveShiftSession(senderNumber);
+
+  // Meta may deliver the same image webhook again. Never interpret a duplicate full image
+  // as the requested close-up section.
+  if (
+    existingSession &&
+    (
+      existingSession.rootMessageId === message.id ||
+      (existingSession.retryMessageIds || []).includes(message.id)
+    )
+  ) {
+    console.log('Duplicate shift image webhook ignored:', message.id);
+    return;
+  }
+
   try {
     const imageBuffer = await downloadWhatsAppImage(message.image?.id);
-    const result = await recognizeReceipt(imageBuffer);
+    const reasons = await getPayInOutReasons();
 
-    if (!result.success) {
-      // Do not incorrectly tell the employee that a visibly clear photo is unclear.
-      // Tell them exactly which printed field could not be read so a retry can be framed correctly.
-      const failureReply = result.reason === 'branch_not_found'
-        ? 'Receipt එකේ Branch නම read වුණේ නැහැ. Branch සහ Shift Summary header එක පේන විදිහට photo එක නැවත එවන්න.'
-        : 'Receipt එකේ Actual Ending Cash value එක read වුණේ නැහැ. Cash Drawer කොටස පේන විදිහට photo එක නැවත එවන්න.';
-      const sendResult = await sendWhatsAppMessage(senderNumber, failureReply);
+    // If a session is waiting for a specific section, treat this image ONLY as that section.
+    if (existingSession?.awaitingSection) {
+      const section = existingSession.awaitingSection;
+      const partial = await recognizeReceiptSection(imageBuffer, section);
+      const merged = {
+        ...existingSession,
+        updatedAt: new Date(),
+        retryMessageIds: [...(existingSession.retryMessageIds || []), message.id]
+      };
 
-      await receiptRef.set(
-        {
-          status: 'needs_review',
-          failureReason: result.reason,
-          detectedBranch: result.branch || null,
-          drawerValues: result.drawerValues || null,
-          branchOcrPreview: result.branchOcrPreview || null,
-          drawerOcrPreview: result.drawerOcrPreview || null,
-          replyText: failureReply,
-          replySent: Boolean(sendResult?.success),
-          processedAt: new Date()
-        },
+      if (section === 'branch' && partial.success && partial.branch) {
+        merged.branch = partial.branch;
+        merged.branchRaw = partial.branchRaw || null;
+      } else if (section === 'cash_drawer' && partial.success && Number.isFinite(Number(partial.actualEndingCash))) {
+        merged.actualEndingCash = Number(partial.actualEndingCash);
+        merged.drawerValues = partial.drawerValues || merged.drawerValues || null;
+        merged.difference = partial.difference ?? merged.difference ?? null;
+      } else if (section === 'pay_in_out' && partial.success) {
+        const items = extractPayInOutItems(partial.text, reasons);
+        const inspection = inspectPayInOutSection(partial.text, items);
+        if (inspection.verified) {
+          merged.payInOutItems = items;
+          merged.payInOutVerified = true;
+          merged.payInOutTotals = {
+            totalPayIn: inspection.totalPayIn,
+            totalPayOut: inspection.totalPayOut
+          };
+        }
+      }
+
+      const stillMissing = nextMissingSection(merged);
+      if (stillMissing === section) {
+        const retryReply = `මේ කොටස තවම හරියට read වුණේ නැහැ. ${sectionPrompt(section)}`;
+        await sendWhatsAppMessage(senderNumber, retryReply);
+        await sessionRef.set(
+          { ...merged, awaitingSection: section, status: 'waiting_section', lastPrompt: retryReply },
+          { merge: true }
+        );
+        await currentReceiptRef.set(
+          { status: 'section_retry_failed', section, senderNumber, processedAt: new Date() },
+          { merge: true }
+        );
+        return;
+      }
+
+      if (stillMissing) {
+        const prompt = sectionPrompt(stillMissing);
+        await sendWhatsAppMessage(senderNumber, prompt);
+        await sessionRef.set(
+          { ...merged, awaitingSection: stillMissing, status: 'waiting_section', lastPrompt: prompt },
+          { merge: true }
+        );
+        await currentReceiptRef.set(
+          { status: 'section_retry_ok', section, nextSection: stillMissing, senderNumber, processedAt: new Date() },
+          { merge: true }
+        );
+        return;
+      }
+
+      const completed = await saveCompletedShift(merged, message.id, senderNumber);
+      await sessionRef.set(
+        { ...merged, awaitingSection: null, status: 'completed', completedAt: new Date(), finalReply: completed.replyText },
         { merge: true }
       );
-
-      console.warn('Shift receipt OCR failed:', message.id, result.reason, result.branchOcrPreview || '');
+      await currentReceiptRef.set(
+        { status: 'section_retry_completed', section, senderNumber, processedAt: new Date() },
+        { merge: true }
+      );
+      console.log('Shift receipt completed after section retries:', merged.rootMessageId, merged.retryMessageIds);
       return;
     }
 
-    const reasons = await getPayInOutReasons();
-    const payInOutItems = extractPayInOutItems(result.payInOutText || result.text, reasons);
-    const replyText = buildReply(result);
-    const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
-    const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
-    const processedAt = new Date();
-    const dateParts = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Asia/Colombo',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    }).formatToParts(processedAt).reduce((acc, part) => {
-      if (part.type !== 'literal') acc[part.type] = part.value;
-      return acc;
-    }, {});
-    const sriLankaDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
-
-    await receiptRef.set(
+    // New full receipt.
+    await currentReceiptRef.set(
       {
-        status: 'completed',
-        branch: result.branch,
-        branchRaw: result.branchRaw || null,
-        actualEndingCash: result.actualEndingCash,
-        balance: result.balance,
-        bringAmount,
-        amountSource: result.amountSource,
-        difference: result.difference ?? result.drawerValues?.difference ?? null,
-        ocrMode: result.ocrMode || null,
-        drawerValues: result.drawerValues,
-        payInOutItems,
-        replyText,
-        replySent: Boolean(sendResult?.success),
-        replyMessageId: sendResult?.messageId || null,
-        dateKey: sriLankaDate,
-        processedAt
+        id: message.id,
+        whatsappMessageId: message.id,
+        senderNumber,
+        mediaId: message.image?.id || null,
+        status: 'processing',
+        receivedAt: new Date()
       },
       { merge: true }
     );
 
-    // History used by the Android app. One document per WhatsApp receipt keeps a complete audit trail.
-    await db.collection('shift_cash_history').doc(message.id).set({
-      id: message.id,
-      whatsappMessageId: message.id,
+    const result = await recognizeReceipt(imageBuffer);
+    const payInOutItems = extractPayInOutItems(result.payInOutText || result.text || '', reasons);
+    const payInspection = inspectPayInOutSection(result.payInOutText || result.text || '', payInOutItems);
+
+    const session = {
+      rootMessageId: message.id,
       senderNumber,
-      branch: result.branch,
+      status: 'processing',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      branch: result.branch || null,
       branchRaw: result.branchRaw || null,
-      actualEndingCash: result.actualEndingCash,
-      removeAmount: result.balance,
-      bringAmount,
+      actualEndingCash: Number.isFinite(Number(result.actualEndingCash)) ? Number(result.actualEndingCash) : null,
+      drawerValues: result.drawerValues || null,
       difference: result.difference ?? result.drawerValues?.difference ?? null,
       payInOutItems,
-      ocrMode: result.ocrMode || null,
-      dateKey: sriLankaDate,
-      replyText,
-      createdAt: processedAt
-    }, { merge: true });
+      payInOutVerified: payInspection.verified,
+      payInOutTotals: {
+        totalPayIn: payInspection.totalPayIn,
+        totalPayOut: payInspection.totalPayOut
+      },
+      retryMessageIds: []
+    };
 
-    console.log('Shift receipt processed:', message.id, replyText, 'PayIn/Out:', payInOutItems);
-  } catch (error) {
-    console.error('Shift receipt processing error:', message.id, error);
+    const missing = nextMissingSection(session);
 
-    // Do not guess a cash value when OCR/media processing fails.
-    try {
-      const failureReply = 'Photo එක පැහැදිලිව නැවත එවන්න.';
-      const sendResult = await sendWhatsAppMessage(senderNumber, failureReply);
-      await receiptRef.set(
+    if (missing) {
+      const prompt = sectionPrompt(missing);
+      await sendWhatsAppMessage(senderNumber, prompt);
+      await sessionRef.set(
+        { ...session, awaitingSection: missing, status: 'waiting_section', lastPrompt: prompt },
+        { merge: true }
+      );
+      await currentReceiptRef.set(
         {
-          status: 'error',
-          error: error.message,
-          replyText: failureReply,
-          replySent: Boolean(sendResult?.success),
+          status: 'waiting_section',
+          awaitingSection: missing,
+          detectedBranch: session.branch,
+          drawerValues: session.drawerValues,
+          payInOutItems: session.payInOutItems,
+          payInOutVerified: session.payInOutVerified,
+          replyText: prompt,
           processedAt: new Date()
         },
+        { merge: true }
+      );
+      console.log('Shift receipt waiting for section:', message.id, missing);
+      return;
+    }
+
+    const completed = await saveCompletedShift(session, message.id, senderNumber);
+    await sessionRef.set(
+      { ...session, awaitingSection: null, status: 'completed', completedAt: new Date(), finalReply: completed.replyText },
+      { merge: true }
+    );
+    console.log('Shift receipt completed from full image:', message.id);
+  } catch (error) {
+    console.error('Shift receipt processing error:', message.id, error);
+    try {
+      const failureReply = 'Photo processing එකේ error එකක් ආවා. Receipt එක නැවත photo කරලා එවන්න.';
+      await sendWhatsAppMessage(senderNumber, failureReply);
+      await currentReceiptRef.set(
+        { status: 'error', error: error.message, replyText: failureReply, processedAt: new Date() },
         { merge: true }
       );
     } catch (replyError) {
-      await receiptRef.set(
-        {
-          status: 'error',
-          error: error.message,
-          replyError: replyError.message,
-          replySent: false,
-          processedAt: new Date()
-        },
-        { merge: true }
-      );
       console.error('Shift receipt failure reply error:', replyError);
     }
   }
