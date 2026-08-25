@@ -205,6 +205,147 @@ function findNearbyMoney(lines, index, maxDistance = 2) {
   return null;
 }
 
+
+function isCashDrawerHeading(line) {
+  const normalized = normalizeLine(line);
+  return looksLike(normalized, ['cash', 'drawer']) ||
+    lineHasFuzzyWords(normalized, ['cash', 'drawer'], 2) ||
+    (fuzzyContains(normalized, 'cash', 2) && fuzzyContains(normalized, 'drawer', 3));
+}
+
+function isDrawerEndHeading(line) {
+  const compact = similarityText(line);
+  return compact.includes('audit') || fuzzyContains(line, 'audit', 2) ||
+    compact.includes('firstreceipt') || compact.includes('lastreceipt');
+}
+
+function getCashDrawerBlock(lines) {
+  const normalized = (lines || []).map((line) => normalizeLine(line)).filter(Boolean);
+  const start = normalized.findIndex(isCashDrawerHeading);
+  if (start < 0) return [];
+
+  const block = [];
+  for (let index = start + 1; index < Math.min(normalized.length, start + 18); index += 1) {
+    const line = normalized[index];
+    if (isDrawerEndHeading(line)) break;
+    block.push(line);
+  }
+  return block;
+}
+
+function moneyOnlyLine(line) {
+  const cleaned = normalizeLine(line);
+  if (!cleaned) return null;
+  const textWithoutMoney = cleaned.replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?/g, ' ')
+    .replace(/[.\-: ]/g, '')
+    .trim();
+  if (textWithoutMoney.length > 2) return null;
+  return extractLastMoney(cleaned);
+}
+
+function findStrictDrawerValues(lines) {
+  const block = getCashDrawerBlock(lines);
+  const values = {
+    startingCash: null,
+    netCashInflow: null,
+    expectedEndingCash: null,
+    actualEndingCash: null,
+    difference: null
+  };
+  if (!block.length) return { values, block, confidence: 0 };
+
+  const labelDefinitions = [
+    ['startingCash', ['starting', 'cash']],
+    ['netCashInflow', ['net', 'cash', 'inflow']],
+    ['expectedEndingCash', ['expected', 'ending', 'cash']],
+    ['actualEndingCash', ['actual', 'ending', 'cash']],
+    ['difference', ['difference']]
+  ];
+
+  let labelledCount = 0;
+  for (let index = 0; index < block.length; index += 1) {
+    const line = block[index];
+    for (const [field, words] of labelDefinitions) {
+      if (values[field] !== null) continue;
+      const matched = words.length === 1
+        ? fuzzyContains(line, words[0], 3)
+        : lineHasFuzzyWords(line, words, 3);
+      if (!matched) continue;
+
+      let amount = extractLastMoney(line);
+      if (amount === null) {
+        for (let offset = 1; offset <= 2; offset += 1) {
+          const next = block[index + offset];
+          if (!next) break;
+          const anotherLabel = labelDefinitions.some(([, checkWords]) =>
+            checkWords.length === 1 ? fuzzyContains(next, checkWords[0], 2) : lineHasFuzzyWords(next, checkWords, 2)
+          );
+          if (anotherLabel) break;
+          amount = moneyOnlyLine(next);
+          if (amount !== null) break;
+        }
+      }
+      if (amount !== null) {
+        values[field] = amount;
+        labelledCount += 1;
+      }
+    }
+  }
+
+  // Strong sequence fallback is allowed ONLY inside the Cash Drawer block and only if drawer math agrees.
+  if (values.actualEndingCash === null) {
+    const numericRows = [];
+    for (const line of block) {
+      const amount = extractLastMoney(line);
+      if (amount !== null) numericRows.push(amount);
+    }
+    for (let start = 0; start + 4 < numericRows.length; start += 1) {
+      const [starting, inflow, expected, actual, difference] = numericRows.slice(start, start + 5);
+      const expectedMath = Math.round((starting + inflow) * 100) / 100;
+      const actualMath = Math.round((expected + difference) * 100) / 100;
+      if (
+        starting >= 0 && starting < 50000 && inflow >= 0 && inflow < 2000000 &&
+        expected >= 4000 && expected < 2000000 && actual >= 4000 && actual < 2000000 &&
+        Math.abs(expectedMath - expected) <= 2 && Math.abs(actualMath - actual) <= 2 &&
+        Math.abs(difference) <= 10000
+      ) {
+        if (values.startingCash === null) values.startingCash = starting;
+        if (values.netCashInflow === null) values.netCashInflow = inflow;
+        if (values.expectedEndingCash === null) values.expectedEndingCash = expected;
+        values.actualEndingCash = actual;
+        if (values.difference === null) values.difference = difference;
+        break;
+      }
+    }
+  }
+
+  if (values.difference === null && values.actualEndingCash !== null && values.expectedEndingCash !== null) {
+    const derived = Math.round((values.actualEndingCash - values.expectedEndingCash) * 100) / 100;
+    if (Math.abs(derived) <= 10000) values.difference = derived;
+  }
+
+  let confidence = 0;
+  if (values.actualEndingCash !== null) confidence += 4;
+  if (values.expectedEndingCash !== null) confidence += 2;
+  if (values.startingCash !== null) confidence += 1;
+  if (values.netCashInflow !== null) confidence += 1;
+  if (values.difference !== null) confidence += 1;
+  confidence += Math.min(labelledCount, 3);
+  return { values, block, confidence };
+}
+
+function strictActualFromDrawerBlock(lines) {
+  const result = findStrictDrawerValues(lines);
+  const raw = result.values.actualEndingCash;
+  const normalized = normalizeActualEndingCashCandidate(raw);
+  return {
+    amount: normalized,
+    values: result.values,
+    block: result.block,
+    confidence: result.confidence
+  };
+}
+
 function findDrawerValues(lines) {
   const values = {
     startingCash: null,
@@ -619,22 +760,58 @@ async function recognizeReceipt(imageBuffer) {
     let branchInfo = extractBranch(branchLines);
     if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
-    const drawerValues = findDrawerValues(allLines);
-    let chosen = chooseActualEndingCash(drawerValues);
+    // PHASE 18 SAFETY RULE:
+    // Actual Ending Cash is NEVER allowed to come from Sales/Credit/Card/PayIn sections.
+    // It must be found inside a Cash Drawer block, or be confirmed by Cash Drawer math.
+    const drawerPassResults = drawerTexts.map((text) =>
+      strictActualFromDrawerBlock(text.split(/\r?\n/).filter(Boolean))
+    );
+    const fullPassResults = fullTexts.map((text) =>
+      strictActualFromDrawerBlock(text.split(/\r?\n/).filter(Boolean))
+    );
+    const strictResults = [...drawerPassResults, ...fullPassResults]
+      .filter((item) => item.amount !== null);
 
+    let chosen = { amount: null, source: null };
+    let drawerValues = { startingCash: null, netCashInflow: null, expectedEndingCash: null, actualEndingCash: null, difference: null };
+    let drawerBlockPreview = '';
+
+    if (strictResults.length) {
+      const groups = new Map();
+      strictResults.forEach((item) => {
+        const key = Number(item.amount).toFixed(2);
+        const group = groups.get(key) || { count: 0, score: 0, best: item };
+        group.count += 1;
+        group.score += item.confidence;
+        if (item.confidence > group.best.confidence) group.best = item;
+        groups.set(key, group);
+      });
+
+      const ranked = [...groups.entries()].sort((a, b) => {
+        if (b[1].count !== a[1].count) return b[1].count - a[1].count;
+        return b[1].score - a[1].score;
+      });
+      const [key, winner] = ranked[0];
+      const candidate = Number(key);
+
+      // Require either agreement between OCR passes or a highly structured drawer read.
+      if (winner.count >= 2 || winner.best.confidence >= 8) {
+        chosen = {
+          amount: candidate,
+          source: winner.count >= 2 ? 'cash_drawer_consensus' : 'cash_drawer_high_confidence'
+        };
+        drawerValues = winner.best.values;
+        drawerBlockPreview = winner.best.block.join(' | ');
+      }
+    }
+
+    // Last safe fallback: parse the combined OCR, but still restrict extraction to Cash Drawer block only.
     if (chosen.amount === null) {
-      const directCandidates = [...drawerTexts, ...fullTexts]
-        .map(extractActualEndingCashFromText)
-        .filter((value) => value !== null);
-      if (directCandidates.length) {
-        const counts = new Map();
-        for (const value of directCandidates) {
-          const key = Number(value).toFixed(2);
-          counts.set(key, (counts.get(key) || 0) + 1);
-        }
-        const best = Number([...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]);
-        chosen = { amount: best, source: 'labelled_actual_ending_cash_fallback' };
-        drawerValues.actualEndingCash = best;
+      const combinedStrict = strictActualFromDrawerBlock(allLines);
+      if (combinedStrict.amount !== null && combinedStrict.confidence >= 8) {
+        chosen = { amount: combinedStrict.amount, source: 'cash_drawer_combined_high_confidence' };
+        drawerValues = combinedStrict.values;
+        drawerBlockPreview = combinedStrict.block.join(' | ');
       }
     }
 
@@ -653,13 +830,13 @@ async function recognizeReceipt(imageBuffer) {
         reason: 'actual_ending_cash_not_found',
         branch: branchInfo.branch,
         drawerValues,
-        drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
+        drawerOcrPreview: drawerBlockPreview || drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
         text: combinedText
       };
     }
 
     const balance = calculateBalance(chosen.amount);
-    const resolvedDifference = resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
+    const resolvedDifference = drawerValues.difference !== null ? drawerValues.difference : resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
 
     return {
       success: true,
@@ -672,7 +849,7 @@ async function recognizeReceipt(imageBuffer) {
       drawerValues,
       payInOutText: fullText || combinedText,
       text: combinedText,
-      ocrMode: 'phase17_bounded_ocr'
+      ocrMode: 'phase18_strict_cash_drawer'
     };
   });
 }
@@ -682,6 +859,12 @@ function calculateBringAmount(actualEndingCash, balance) {
 }
 
 function buildReply(result) {
+  if (!Number.isFinite(result.actualEndingCash) || !Number.isFinite(result.balance)) {
+    throw new Error('Shift cash result is incomplete');
+  }
+  if (!(result.balance >= 4000 && result.balance < 5000)) {
+    throw new Error(`Shift cash remainder failed safety check: ${result.balance}`);
+  }
   const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
   return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} බාර දෙන්න.`;
 }
@@ -780,5 +963,7 @@ module.exports = {
   calculateBringAmount,
   buildReply,
   formatMoney,
-  extractPayInOutItems
+  extractPayInOutItems,
+  getCashDrawerBlock,
+  findStrictDrawerValues
 };
