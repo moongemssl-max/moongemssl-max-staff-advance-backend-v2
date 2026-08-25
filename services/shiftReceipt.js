@@ -1041,15 +1041,14 @@ function extractPayInOutItems(text, configuredReasons = []) {
 
   function normalizeReasonKey(value) {
     return compactLetters(String(value || ''))
-      .replace(/advance$/i, 'advance')
       .replace(/battery/g, 'battry');
   }
 
   function canonicalReason(raw) {
-    const key = normalizeReasonKey(raw);
+    const cleaned = String(raw || '').trim();
+    const key = normalizeReasonKey(cleaned);
     if (!key) return null;
 
-    // Prefer configured names first.
     const exact = configured.find((reason) => {
       const rk = normalizeReasonKey(reason);
       return key.includes(rk) || rk.includes(key);
@@ -1057,79 +1056,73 @@ function extractPayInOutItems(text, configuredReasons = []) {
     if (exact) return exact;
 
     const builtin = [
-      'Hadunkuru','Poltel','Petrol','Adu','Wedi','Battry','Bill Payment',
-      'Rusiru Advance','Prasanna Advance','Nandasena Advance'
+      'Hadunkuru', 'Poltel', 'Petrol', 'Adu', 'Wedi', 'Battry',
+      'Bill Payment', 'Rusiru Advance', 'Prasanna Advance', 'Nandasena Advance'
     ];
+
     const fuzzy = builtin.find((reason) => {
       const rk = normalizeReasonKey(reason);
-      return key.includes(rk) || rk.includes(key) || fuzzyContains(raw, reason, 3);
+      return key.includes(rk) || rk.includes(key) || fuzzyContains(cleaned, reason, 3);
     });
-    return fuzzy || raw.trim();
+
+    return fuzzy || cleaned;
   }
 
-  function explicitType(line) {
-    if (/\(\s*out\s*\)/i.test(line) || /\bout\b/i.test(line)) return 'OUT';
-    if (/\(\s*in\s*\)/i.test(line) || /\bin\b/i.test(line)) return 'IN';
-    return null;
+  // Only a real transaction row may enter this parser.
+  // Valid examples:
+  //   (OUT) Rusiru Advance 21000.00
+  //   (IN) Wedi 34.00
+  // Summary rows such as Count / Total Payin / Total Payout / Net Inflow are ignored.
+  function transactionTypeAtStart(line) {
+    const match = String(line).match(/^\s*\(?\s*(IN|OUT)\s*\)?(?:\s+|$)/i);
+    return match ? match[1].toUpperCase() : null;
   }
 
-  // Strong direct parse:
-  // "(OUT) Rusiru Advance 21000.00"
-  // "(IN) Wedi 34.00"
-  const directPattern = /^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+?)\s+(-?[0-9OoIl|BS][0-9OoIl|BS,.\s]*[0-9OoIl|BS])\s*$/i;
+  function isSummaryLine(line) {
+    const c = similarityText(line);
+    return (
+      c.includes('payinpayoutcount') ||
+      c.includes('totalpayin') ||
+      c.includes('totalpayout') ||
+      c.includes('netinflow') ||
+      c.includes('payinpayout') ||
+      c.includes('payinoutcount')
+    );
+  }
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    const compact = similarityText(line);
 
-    if (
-      compact.includes('payinpayoutcount') ||
-      compact.includes('totalpayin') ||
-      compact.includes('totalpayout') ||
-      compact.includes('netinflow') ||
-      compact.includes('payinpayout')
-    ) continue;
+    if (isSummaryLine(line)) continue;
 
-    let type = explicitType(line);
-    let reasonRaw = '';
-    let amount = null;
+    const type = transactionTypeAtStart(line);
+    if (!type) continue;
 
-    const direct = line.match(directPattern);
-    if (direct) {
-      type = direct[1].toUpperCase();
-      reasonRaw = direct[2].trim();
-      amount = parseMoney(direct[3]);
-    }
+    let amount = extractLastMoney(line);
+    let reasonRaw = line
+      .replace(/^\s*\(?\s*(?:IN|OUT)\s*\)?\s*/i, '')
+      .trim();
 
-    // If direct pattern failed, still accept explicit IN/OUT + last money.
-    if (!direct && type) {
-      amount = extractLastMoney(line);
-      if (amount !== null) {
-        reasonRaw = line
-          .replace(/\(\s*(?:IN|OUT)\s*\)/ig, ' ')
-          .replace(/\b(?:IN|OUT)\b/ig, ' ')
-          .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
-      }
-    }
-
-    // Split line fallback: type+reason on one line, amount on next.
-    if (type && amount === null) {
-      reasonRaw = line
-        .replace(/\(\s*(?:IN|OUT)\s*\)/ig, ' ')
-        .replace(/\b(?:IN|OUT)\b/ig, ' ')
+    if (amount !== null) {
+      // Remove only the final amount from the reason text.
+      reasonRaw = reasonRaw
+        .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, '')
+        .replace(/\s+/g, ' ')
         .trim();
-
+    } else {
+      // Thermal OCR may place the amount on the next line.
+      // Accept only a number-only adjacent line; never steal totals/summary values.
       for (const j of [i + 1, i - 1]) {
         if (j < 0 || j >= lines.length) continue;
         const neighbour = lines[j];
-        const nc = similarityText(neighbour);
-        if (
-          nc.includes('totalpay') ||
-          nc.includes('netinflow') ||
-          nc.includes('payinpayoutcount')
-        ) continue;
+        if (isSummaryLine(neighbour) || transactionTypeAtStart(neighbour)) continue;
+
+        const stripped = neighbour
+          .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?/g, '')
+          .replace(/[.\-: ]/g, '')
+          .trim();
+
+        if (stripped.length > 2) continue;
 
         const candidate = extractLastMoney(neighbour);
         if (candidate !== null) {
@@ -1139,7 +1132,7 @@ function extractPayInOutItems(text, configuredReasons = []) {
       }
     }
 
-    if (!type || amount === null || !Number.isFinite(Number(amount))) continue;
+    if (amount === null || !Number.isFinite(Number(amount))) continue;
 
     const absolute = Math.round(Math.abs(Number(amount)) * 100) / 100;
     if (!(absolute > 0 && absolute <= 1000000)) continue;
@@ -1150,6 +1143,7 @@ function extractPayInOutItems(text, configuredReasons = []) {
     const key = `${type}|${normalizeReasonKey(reason)}|${absolute.toFixed(2)}`;
     if (seen.has(key)) continue;
     seen.add(key);
+
     found.push({ reason, amount: absolute, type });
   }
 
