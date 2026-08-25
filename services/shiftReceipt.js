@@ -1027,9 +1027,9 @@ function detectPayDirection(line, amount) {
 }
 
 function extractPayInOutItems(text, configuredReasons = []) {
-  const lines = String(text || '')
+  const rawLines = String(text || '')
     .split(/\r?\n/)
-    .map((line) => normalizeLine(line))
+    .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
   const configured = (configuredReasons || [])
@@ -1044,7 +1044,11 @@ function extractPayInOutItems(text, configuredReasons = []) {
   }
 
   function canonicalReason(raw) {
-    const cleaned = String(raw || '').trim();
+    const cleaned = String(raw || '')
+      .replace(/[^a-zA-Z0-9 ]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const key = reasonKey(cleaned);
     if (!key) return null;
 
@@ -1056,7 +1060,7 @@ function extractPayInOutItems(text, configuredReasons = []) {
 
     const exact = known.find((reason) => {
       const rk = reasonKey(reason);
-      return key.includes(rk) || rk.includes(key);
+      return key === rk || key.includes(rk) || rk.includes(key);
     });
     if (exact) return exact;
 
@@ -1064,18 +1068,23 @@ function extractPayInOutItems(text, configuredReasons = []) {
     return fuzzy || cleaned;
   }
 
-  for (const line of lines) {
-    // STRICT RULE:
-    // A transaction row MUST start with "(IN)" or "(OUT)".
-    // Nothing else in Payin/Payout is allowed into the transaction list.
-    const match = line.match(/^\s*\(\s*(IN|OUT)\s*\)\s+(.+?)\s+(-?[0-9OoIl|BS][0-9OoIl|BS,.\s]*[0-9OoIl|BS])\s*$/i);
-    if (!match) continue;
+  for (const rawLine of rawLines) {
+    const marker = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
+    if (!marker) continue;
 
-    const type = match[1].toUpperCase();
-    const reason = canonicalReason(match[2]);
-    const amount = parseMoney(match[3]);
+    const type = marker[1].toUpperCase();
+    const remainder = marker[2].trim();
 
-    if (!reason || amount === null || !Number.isFinite(Number(amount))) continue;
+    const amount = extractLastMoney(remainder);
+    if (amount === null || !Number.isFinite(Number(amount))) continue;
+
+    const reasonRaw = remainder
+      .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const reason = canonicalReason(reasonRaw);
+    if (!reason || reason.length < 2) continue;
 
     const absoluteAmount = Math.round(Math.abs(Number(amount)) * 100) / 100;
     if (!(absoluteAmount > 0 && absoluteAmount <= 1000000)) continue;
@@ -1257,40 +1266,39 @@ async function recognizeReceiptField(imageBuffer, field, configuredReasons = [])
 
 function reconcilePayItemsWithTotals(items, totals) {
   const list = (Array.isArray(items) ? items : [])
-    .filter(x =>
+    .filter((x) =>
       x &&
       x.reason &&
       ['IN', 'OUT'].includes(String(x.type || '').toUpperCase()) &&
       Number.isFinite(Number(x.amount)) &&
       Number(x.amount) > 0
     )
-    .map(x => ({
+    .map((x) => ({
       reason: String(x.reason).trim(),
       type: String(x.type).toUpperCase(),
       amount: Math.round(Number(x.amount) * 100) / 100
     }));
 
-  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
-    ? Number(totals.count)
-    : null;
+  const expectedCount =
+    totals?.count != null && Number.isFinite(Number(totals.count))
+      ? Number(totals.count)
+      : null;
 
-  // Main Phase25 rule: strict "(IN)/(OUT)" rows + printed count are authoritative.
   if (expectedCount !== null && list.length === expectedCount) {
-    // Optional amount repair when there is exactly one IN and one OUT and printed totals are clear.
     if (
       expectedCount === 2 &&
       Number.isFinite(Number(totals?.totalPayIn)) &&
       Number.isFinite(Number(totals?.totalPayOut))
     ) {
-      const inRows = list.filter(x => x.type === 'IN');
-      const outRows = list.filter(x => x.type === 'OUT');
+      const inRows = list.filter((x) => x.type === 'IN');
+      const outRows = list.filter((x) => x.type === 'OUT');
 
       if (inRows.length === 1 && outRows.length === 1) {
         inRows[0].amount = Math.round(Number(totals.totalPayIn) * 100) / 100;
         outRows[0].amount = Math.round(Number(totals.totalPayOut) * 100) / 100;
       }
     }
-    return { complete: true, items: list, repaired: true };
+    return { complete: true, items: list };
   }
 
   if (expectedCount === 0 && list.length === 0) {
