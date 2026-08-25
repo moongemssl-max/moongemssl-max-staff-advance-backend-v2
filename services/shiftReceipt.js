@@ -819,6 +819,10 @@ async function recognizeReceipt(imageBuffer) {
       return {
         success: false,
         reason: 'branch_not_found',
+        actualEndingCash: chosen.amount,
+        drawerValues,
+        difference: drawerValues.difference,
+        payInOutText: fullText || combinedText,
         text: combinedText,
         branchOcrPreview: branchLines.slice(0, 12).join(' | ')
       };
@@ -852,6 +856,130 @@ async function recognizeReceipt(imageBuffer) {
       ocrMode: 'phase18_strict_cash_drawer'
     };
   });
+}
+
+async function recognizeReceiptSection(imageBuffer, section) {
+  return runOcrExclusive(async () => {
+    const worker = await getSharedWorker();
+
+    const enhanced = await sharp(imageBuffer)
+      .rotate()
+      .grayscale()
+      .normalize()
+      .resize({ width: 2000, withoutEnlargement: false })
+      .sharpen({ sigma: 1.2 })
+      .linear(1.3, -15)
+      .png()
+      .toBuffer();
+
+    const thresholded = await sharp(imageBuffer)
+      .rotate()
+      .grayscale()
+      .normalize()
+      .resize({ width: 2000, withoutEnlargement: false })
+      .threshold(190)
+      .png()
+      .toBuffer();
+
+    const texts = await recognizeVariants(worker, [enhanced, thresholded], 6);
+    const text = texts.join('\n');
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+    if (section === 'branch') {
+      const branchInfo = extractBranch(lines);
+      return {
+        success: Boolean(branchInfo.branch),
+        section,
+        branch: branchInfo.branch,
+        branchRaw: branchInfo.branchRaw,
+        text
+      };
+    }
+
+    if (section === 'cash_drawer') {
+      // On a close-up retry, the employee is explicitly sending only the Cash Drawer section.
+      // Prefer strict Cash Drawer parsing, but if the heading is cropped off, allow labelled
+      // Actual/Expected/Difference lines from the whole close-up. Never use Sales/Card/Credit here.
+      const strict = strictActualFromDrawerBlock(lines);
+      let values = strict.values;
+      let actual = strict.amount;
+
+      if (actual === null) {
+        const loose = findDrawerValues(lines);
+        const labelledActual = extractActualEndingCashFromText(text);
+        values = {
+          startingCash: loose.startingCash,
+          netCashInflow: loose.netCashInflow,
+          expectedEndingCash: loose.expectedEndingCash,
+          actualEndingCash: labelledActual ?? loose.actualEndingCash,
+          difference: loose.difference
+        };
+        actual = normalizeActualEndingCashCandidate(values.actualEndingCash);
+      }
+
+      if (actual !== null && values.difference === null && values.expectedEndingCash !== null) {
+        const derived = Math.round((actual - values.expectedEndingCash) * 100) / 100;
+        if (Math.abs(derived) <= 10000) values.difference = derived;
+      }
+
+      return {
+        success: actual !== null,
+        section,
+        actualEndingCash: actual,
+        drawerValues: values,
+        difference: values.difference,
+        text
+      };
+    }
+
+    if (section === 'pay_in_out') {
+      return {
+        success: text.trim().length > 0,
+        section,
+        text
+      };
+    }
+
+    return { success: false, section, text };
+  });
+}
+
+function inspectPayInOutSection(text, items = []) {
+  const normalized = String(text || '').toLowerCase();
+  const compact = similarityText(normalized);
+  const hasSection = compact.includes('payinpayout') ||
+    compact.includes('payin') || compact.includes('payout');
+
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => normalizeLine(line))
+    .filter(Boolean);
+
+  let totalPayIn = null;
+  let totalPayOut = null;
+
+  for (const line of lines) {
+    const compactLine = similarityText(line);
+    if (compactLine.includes('totalpayin')) {
+      const value = extractLastMoney(line);
+      if (value !== null) totalPayIn = Math.abs(value);
+    }
+    if (compactLine.includes('totalpayout')) {
+      const value = extractLastMoney(line);
+      if (value !== null) totalPayOut = Math.abs(value);
+    }
+  }
+
+  // Verified if we read at least one configured item, or the printed totals clearly say zero.
+  const zeroTotals = totalPayIn === 0 && totalPayOut === 0;
+  const verified = items.length > 0 || (hasSection && zeroTotals);
+
+  return {
+    verified,
+    hasSection,
+    totalPayIn,
+    totalPayOut
+  };
 }
 
 function calculateBringAmount(actualEndingCash, balance) {
@@ -964,6 +1092,8 @@ module.exports = {
   buildReply,
   formatMoney,
   extractPayInOutItems,
+  recognizeReceiptSection,
+  inspectPayInOutSection,
   getCashDrawerBlock,
   findStrictDrawerValues
 };
