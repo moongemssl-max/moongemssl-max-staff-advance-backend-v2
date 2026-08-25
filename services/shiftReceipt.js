@@ -1325,6 +1325,81 @@ async function recognizeReceiptField(imageBuffer, field, configuredReasons = [])
   });
 }
 
+function reconcilePayItemsWithTotals(items, totals) {
+  const list = (Array.isArray(items) ? items : [])
+    .filter(x => x && x.reason && Number.isFinite(Number(x.amount)) && Number(x.amount) > 0)
+    .map(x => ({
+      reason: String(x.reason).trim(),
+      type: String(x.type || '').toUpperCase() === 'OUT' ? 'OUT' : 'IN',
+      amount: Math.round(Number(x.amount) * 100) / 100
+    }));
+
+  if (!totals) return { complete: false, items: list };
+
+  const expectedCount = Number.isFinite(Number(totals.count)) ? Number(totals.count) : null;
+  const totalIn = Number.isFinite(Number(totals.totalPayIn)) ? Number(totals.totalPayIn) : null;
+  const totalOut = Number.isFinite(Number(totals.totalPayOut)) ? Number(totals.totalPayOut) : null;
+  const net = Number.isFinite(Number(totals.netInflow)) ? Number(totals.netInflow) : null;
+
+  // Easy zero case.
+  if ((expectedCount === 0 || expectedCount == null) && totalIn === 0 && totalOut === 0) {
+    return { complete: true, items: [] };
+  }
+
+  // If the printed count says exactly 2 and we have exactly 2 named rows,
+  // use the printed IN/OUT totals to repair OCR amounts/types instead of asking for another photo.
+  if (expectedCount === 2 && list.length === 2 && totalIn != null && totalOut != null) {
+    const a = { ...list[0] };
+    const b = { ...list[1] };
+
+    // Preserve explicit types when they are different.
+    if (a.type !== b.type) {
+      const inItem = a.type === 'IN' ? a : b;
+      const outItem = a.type === 'OUT' ? a : b;
+      inItem.amount = Math.round(totalIn * 100) / 100;
+      outItem.amount = Math.round(totalOut * 100) / 100;
+
+      const repaired = [a, b];
+      const repairedNet = Math.round(
+        (repaired.filter(x => x.type === 'IN').reduce((sum,x)=>sum+x.amount,0) -
+         repaired.filter(x => x.type === 'OUT').reduce((sum,x)=>sum+x.amount,0)) * 100
+      ) / 100;
+
+      if (net == null || Math.abs(repairedNet - net) <= 0.02) {
+        return { complete: true, items: repaired, repaired: true };
+      }
+    }
+
+    // If OCR lost one/both type markers, infer by matching the printed totals to the two amounts.
+    const amounts = [a.amount, b.amount];
+    const directMatch =
+      Math.abs(amounts[0] - totalIn) <= 0.02 && Math.abs(amounts[1] - totalOut) <= 0.02;
+    const reverseMatch =
+      Math.abs(amounts[1] - totalIn) <= 0.02 && Math.abs(amounts[0] - totalOut) <= 0.02;
+
+    if (directMatch || reverseMatch) {
+      if (directMatch) {
+        a.type = 'IN'; b.type = 'OUT';
+      } else {
+        a.type = 'OUT'; b.type = 'IN';
+      }
+      return { complete: true, items: [a, b], repaired: true };
+    }
+  }
+
+  // Generic exact validation.
+  const inSum = Math.round(list.filter(x => x.type === 'IN').reduce((sum,x)=>sum+x.amount,0)*100)/100;
+  const outSum = Math.round(list.filter(x => x.type === 'OUT').reduce((sum,x)=>sum+x.amount,0)*100)/100;
+  const calcNet = Math.round((inSum - outSum)*100)/100;
+
+  const countOk = expectedCount == null || list.length === expectedCount;
+  const inOk = totalIn == null || Math.abs(inSum-totalIn) <= 0.02;
+  const outOk = totalOut == null || Math.abs(outSum-totalOut) <= 0.02;
+  const netOk = net == null || Math.abs(calcNet-net) <= 0.02;
+
+  return { complete: countOk && inOk && outOk && netOk, items: list };
+}
+
 module.exports = {
   downloadWhatsAppImage,
   recognizeReceipt,
@@ -1339,6 +1414,7 @@ module.exports = {
   extractPayTotalsAndCount,
   mergeUniquePayItems,
   payItemsComplete,
+  reconcilePayItemsWithTotals,
   getCashDrawerBlock,
   findStrictDrawerValues
 };
