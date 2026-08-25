@@ -74,7 +74,23 @@ function requiredField(data) {
 
   const totals = data?.payTotals || null;
   const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
-  if (!totals || (totals.count == null && totals.totalPayIn == null && totals.totalPayOut == null)) return 'pay_totals';
+
+  if (!totals || (totals.count == null && totals.totalPayIn == null && totals.totalPayOut == null)) {
+    return 'pay_totals';
+  }
+
+  // FINAL RULE:
+  // extractPayInOutItems returns transaction rows only.
+  // If printed Payin/Payout Count matches the number of transaction rows,
+  // Pay In/Out is COMPLETE. Never ask for pay_line again.
+  if (
+    totals.count != null &&
+    Number.isFinite(Number(totals.count)) &&
+    items.length === Number(totals.count)
+  ) {
+    return null;
+  }
+
   const reconciled = reconcilePayItemsWithTotals(items, totals);
   if (!reconciled.complete) return 'pay_line';
   return null;
@@ -131,10 +147,11 @@ function fieldPrompt(field, data = {}) {
       const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
       const got = items.length;
       const expected = totals.count != null ? Number(totals.count) : null;
-      const need = expected != null
-        ? (got <= expected ? ` (${got}/${expected} lines read)` : ` (${expected} expected; OCR mismatch)`)
-        : '';
-      return `Pay In/Out එකේ තව line එකක් පැහැදිලි නැහැ${need}. Reason + Amount + (IN/OUT) පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න. උදා: (OUT) Rusiru Advance 21000.00`;
+      if (expected != null && got === expected) {
+        return 'Pay In/Out complete.';
+      }
+      const need = expected != null ? ` (${got}/${expected} lines read)` : '';
+      return `Pay In/Out එකේ තව line එකක් පැහැදිලි නැහැ${need}. Reason + Amount + (IN/OUT) පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න.`;
     }
     default:
       return 'Read නොවුණු පොඩි කොටස විතරක් ලඟින් photo එකක් එවන්න.';
@@ -190,7 +207,7 @@ async function saveCompletedShift(data, currentMessageId, senderNumber) {
     drawerValues: data.drawerValues || null,
     payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems : [],
     payInOutTotals: data.payTotals || null,
-    ocrMode: 'phase26_final_field_recovery',
+    ocrMode: 'phase20_field_recovery',
     dateKey: sriLankaDate,
     replyText,
     replySent: Boolean(sendResult?.success),
@@ -277,16 +294,7 @@ async function processShiftReceiptImage(message, senderNumber) {
         merged.payInOutItems = reconciledPay.items;
       }
 
-      let next = requiredField(merged);
-      if (
-        field === 'pay_line' &&
-        merged.payTotals?.count != null &&
-        Array.isArray(merged.payInOutItems) &&
-        merged.payInOutItems.length === Number(merged.payTotals.count) &&
-        next === 'pay_line'
-      ) {
-        next = null;
-      }
+      const next = requiredField(merged);
       if (next === field) {
         const reply = `ඒ value එක තවම හරියට read වුණේ නැහැ. ${fieldPrompt(field, merged)}`;
         await sendWhatsAppMessage(senderNumber, reply);
