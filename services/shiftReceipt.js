@@ -1084,6 +1084,97 @@ function extractPayInOutItems(text, reasons = []) {
   return found;
 }
 
+function extractPayTotalsAndCount(text) {
+  const lines = String(text || '').split(/\r?\n/).map(normalizeLine).filter(Boolean);
+  const result = { totalPayIn: null, totalPayOut: null, count: null };
+  for (const line of lines) {
+    const c = similarityText(line);
+    if (c.includes('payinpayoutcount') || (c.includes('pay') && c.includes('count'))) {
+      const v = extractLastMoney(line);
+      if (v !== null && v >= 0 && v < 100) result.count = Math.round(v);
+    } else if (c.includes('totalpayin')) {
+      const v = extractLastMoney(line);
+      if (v !== null) result.totalPayIn = Math.abs(v);
+    } else if (c.includes('totalpayout')) {
+      const v = extractLastMoney(line);
+      if (v !== null) result.totalPayOut = Math.abs(v);
+    }
+  }
+  return result;
+}
+
+function mergeUniquePayItems(existing, incoming) {
+  const all = [...(existing || []), ...(incoming || [])];
+  const seen = new Set();
+  return all.filter((item) => {
+    const key = `${String(item.reason || '').trim().toLowerCase()}|${String(item.type || '').toUpperCase()}|${Number(item.amount || 0).toFixed(2)}`;
+    if (!item.reason || !Number.isFinite(Number(item.amount)) || Number(item.amount) <= 0 || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function payItemsComplete(items, totals) {
+  const list = Array.isArray(items) ? items : [];
+  const inSum = Math.round(list.filter(x => String(x.type).toUpperCase() === 'IN').reduce((a,x)=>a+Number(x.amount||0),0)*100)/100;
+  const outSum = Math.round(list.filter(x => String(x.type).toUpperCase() === 'OUT').reduce((a,x)=>a+Number(x.amount||0),0)*100)/100;
+  const countOk = totals?.count == null || list.length >= totals.count;
+  const inOk = totals?.totalPayIn == null || Math.abs(inSum - Number(totals.totalPayIn)) <= 0.02;
+  const outOk = totals?.totalPayOut == null || Math.abs(outSum - Number(totals.totalPayOut)) <= 0.02;
+
+  // If both printed totals are exactly zero, there are no rows to recover.
+  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0) return true;
+
+  // Need at least one reliable printed control (count or a total) before declaring complete.
+  const hasControl = totals && (totals.count != null || totals.totalPayIn != null || totals.totalPayOut != null);
+  return Boolean(hasControl && countOk && inOk && outOk);
+}
+
+async function recognizeReceiptField(imageBuffer, field, configuredReasons = []) {
+  return runOcrExclusive(async () => {
+    const worker = await getSharedWorker();
+    const variants = [
+      await sharp(imageBuffer).rotate().grayscale().normalize().resize({ width: 2200, withoutEnlargement: false }).sharpen({ sigma: 1.3 }).png().toBuffer(),
+      await sharp(imageBuffer).rotate().grayscale().normalize().resize({ width: 2200, withoutEnlargement: false }).threshold(185).png().toBuffer()
+    ];
+    const texts = await recognizeVariants(worker, variants, 6);
+    const text = texts.join('\n');
+    const lines = text.split(/\r?\n/).map(normalizeLine).filter(Boolean);
+
+    if (field === 'branch') {
+      const b = extractBranch(lines);
+      return { success: Boolean(b.branch), field, branch: b.branch, branchRaw: b.branchRaw, text };
+    }
+
+    if (field === 'actual_ending_cash') {
+      const labelled = extractActualEndingCashFromText(text);
+      const strict = strictActualFromDrawerBlock(lines);
+      const amount = normalizeActualEndingCashCandidate(labelled ?? strict.amount);
+      return { success: amount !== null, field, actualEndingCash: amount, drawerValues: strict.values, text };
+    }
+
+    if (field === 'difference') {
+      const direct = extractStrictDifferenceFromText(text);
+      const drawer = findStrictDrawerValues(lines);
+      const value = direct ?? drawer.values.difference;
+      return { success: value !== null && Number.isFinite(Number(value)), field, difference: value, text };
+    }
+
+    if (field === 'pay_totals') {
+      const totals = extractPayTotalsAndCount(text);
+      const useful = totals.count != null || totals.totalPayIn != null || totals.totalPayOut != null;
+      return { success: useful, field, totals, text };
+    }
+
+    if (field === 'pay_line') {
+      const items = extractPayInOutItems(text, configuredReasons);
+      return { success: items.length > 0, field, items, text };
+    }
+
+    return { success: false, field, text };
+  });
+}
+
 module.exports = {
   downloadWhatsAppImage,
   recognizeReceipt,
@@ -1094,6 +1185,10 @@ module.exports = {
   extractPayInOutItems,
   recognizeReceiptSection,
   inspectPayInOutSection,
+  recognizeReceiptField,
+  extractPayTotalsAndCount,
+  mergeUniquePayItems,
+  payItemsComplete,
   getCashDrawerBlock,
   findStrictDrawerValues
 };
