@@ -1039,112 +1039,52 @@ function extractPayInOutItems(text, configuredReasons = []) {
   const found = [];
   const seen = new Set();
 
-  function normalizeReasonKey(value) {
-    return compactLetters(String(value || ''))
-      .replace(/battery/g, 'battry');
+  function reasonKey(value) {
+    return compactLetters(String(value || '')).replace(/battery/g, 'battry');
   }
 
   function canonicalReason(raw) {
     const cleaned = String(raw || '').trim();
-    const key = normalizeReasonKey(cleaned);
+    const key = reasonKey(cleaned);
     if (!key) return null;
 
-    const exact = configured.find((reason) => {
-      const rk = normalizeReasonKey(reason);
+    const known = [
+      ...configured,
+      'Hadunkuru', 'Poltel', 'Petrol', 'Adu', 'Wedi', 'Battry',
+      'Bill Payment', 'Rusiru Advance', 'Prasanna Advance', 'Nandasena Advance'
+    ].filter(Boolean);
+
+    const exact = known.find((reason) => {
+      const rk = reasonKey(reason);
       return key.includes(rk) || rk.includes(key);
     });
     if (exact) return exact;
 
-    const builtin = [
-      'Hadunkuru', 'Poltel', 'Petrol', 'Adu', 'Wedi', 'Battry',
-      'Bill Payment', 'Rusiru Advance', 'Prasanna Advance', 'Nandasena Advance'
-    ];
-
-    const fuzzy = builtin.find((reason) => {
-      const rk = normalizeReasonKey(reason);
-      return key.includes(rk) || rk.includes(key) || fuzzyContains(cleaned, reason, 3);
-    });
-
+    const fuzzy = known.find((reason) => fuzzyContains(cleaned, reason, 3));
     return fuzzy || cleaned;
   }
 
-  // Only a real transaction row may enter this parser.
-  // Valid examples:
-  //   (OUT) Rusiru Advance 21000.00
-  //   (IN) Wedi 34.00
-  // Summary rows such as Count / Total Payin / Total Payout / Net Inflow are ignored.
-  function transactionTypeAtStart(line) {
-    const match = String(line).match(/^\s*\(?\s*(IN|OUT)\s*\)?(?:\s+|$)/i);
-    return match ? match[1].toUpperCase() : null;
-  }
+  for (const line of lines) {
+    // STRICT RULE:
+    // A transaction row MUST start with "(IN)" or "(OUT)".
+    // Nothing else in Payin/Payout is allowed into the transaction list.
+    const match = line.match(/^\s*\(\s*(IN|OUT)\s*\)\s+(.+?)\s+(-?[0-9OoIl|BS][0-9OoIl|BS,.\s]*[0-9OoIl|BS])\s*$/i);
+    if (!match) continue;
 
-  function isSummaryLine(line) {
-    const c = similarityText(line);
-    return (
-      c.includes('payinpayoutcount') ||
-      c.includes('totalpayin') ||
-      c.includes('totalpayout') ||
-      c.includes('netinflow') ||
-      c.includes('payinpayout') ||
-      c.includes('payinoutcount')
-    );
-  }
+    const type = match[1].toUpperCase();
+    const reason = canonicalReason(match[2]);
+    const amount = parseMoney(match[3]);
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
+    if (!reason || amount === null || !Number.isFinite(Number(amount))) continue;
 
-    if (isSummaryLine(line)) continue;
+    const absoluteAmount = Math.round(Math.abs(Number(amount)) * 100) / 100;
+    if (!(absoluteAmount > 0 && absoluteAmount <= 1000000)) continue;
 
-    const type = transactionTypeAtStart(line);
-    if (!type) continue;
-
-    let amount = extractLastMoney(line);
-    let reasonRaw = line
-      .replace(/^\s*\(?\s*(?:IN|OUT)\s*\)?\s*/i, '')
-      .trim();
-
-    if (amount !== null) {
-      // Remove only the final amount from the reason text.
-      reasonRaw = reasonRaw
-        .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-    } else {
-      // Thermal OCR may place the amount on the next line.
-      // Accept only a number-only adjacent line; never steal totals/summary values.
-      for (const j of [i + 1, i - 1]) {
-        if (j < 0 || j >= lines.length) continue;
-        const neighbour = lines[j];
-        if (isSummaryLine(neighbour) || transactionTypeAtStart(neighbour)) continue;
-
-        const stripped = neighbour
-          .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?/g, '')
-          .replace(/[.\-: ]/g, '')
-          .trim();
-
-        if (stripped.length > 2) continue;
-
-        const candidate = extractLastMoney(neighbour);
-        if (candidate !== null) {
-          amount = candidate;
-          break;
-        }
-      }
-    }
-
-    if (amount === null || !Number.isFinite(Number(amount))) continue;
-
-    const absolute = Math.round(Math.abs(Number(amount)) * 100) / 100;
-    if (!(absolute > 0 && absolute <= 1000000)) continue;
-
-    const reason = canonicalReason(reasonRaw);
-    if (!reason || reason.length < 2) continue;
-
-    const key = `${type}|${normalizeReasonKey(reason)}|${absolute.toFixed(2)}`;
+    const key = `${type}|${reasonKey(reason)}|${absoluteAmount.toFixed(2)}`;
     if (seen.has(key)) continue;
     seen.add(key);
 
-    found.push({ reason, amount: absolute, type });
+    found.push({ reason, amount: absoluteAmount, type });
   }
 
   return found;
@@ -1216,35 +1156,25 @@ function mergeUniquePayItems(existing, incoming) {
 
 function payItemsComplete(items, totals) {
   const list = Array.isArray(items) ? items : [];
-  const inSum = Math.round(
-    list.filter(x => String(x.type).toUpperCase() === 'IN')
-      .reduce((a, x) => a + Number(x.amount || 0), 0) * 100
-  ) / 100;
-  const outSum = Math.round(
-    list.filter(x => String(x.type).toUpperCase() === 'OUT')
-      .reduce((a, x) => a + Number(x.amount || 0), 0) * 100
-  ) / 100;
-  const net = Math.round((inSum - outSum) * 100) / 100;
+  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
+    ? Number(totals.count)
+    : null;
 
-  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0 && (totals?.count == null || totals.count === 0)) {
-    return true;
+  // If receipt explicitly printed Payin/Payout Count, that is the primary control.
+  // Since extractPayInOutItems now ONLY accepts rows beginning "(IN)" or "(OUT)",
+  // matching the printed count means all transaction rows were found.
+  if (expectedCount !== null) {
+    if (expectedCount === 0) return list.length === 0;
+    return list.length === expectedCount;
   }
 
-  const controls = [
-    totals?.count != null,
-    totals?.totalPayIn != null,
-    totals?.totalPayOut != null,
-    totals?.netInflow != null
-  ].filter(Boolean).length;
+  // If count was unreadable, zero totals still safely mean no Pay In/Out rows.
+  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0) {
+    return list.length === 0;
+  }
 
-  if (controls < 2) return false;
-
-  const countOk = totals.count == null || list.length === Number(totals.count);
-  const inOk = totals.totalPayIn == null || Math.abs(inSum - Number(totals.totalPayIn)) <= 0.02;
-  const outOk = totals.totalPayOut == null || Math.abs(outSum - Number(totals.totalPayOut)) <= 0.02;
-  const netOk = totals.netInflow == null || Math.abs(net - Number(totals.netInflow)) <= 0.02;
-
-  return countOk && inOk && outOk && netOk;
+  // Without a readable count, require at least one strict transaction row.
+  return list.length > 0;
 }
 
 async function recognizeReceiptField(imageBuffer, field, configuredReasons = []) {
@@ -1327,77 +1257,47 @@ async function recognizeReceiptField(imageBuffer, field, configuredReasons = [])
 
 function reconcilePayItemsWithTotals(items, totals) {
   const list = (Array.isArray(items) ? items : [])
-    .filter(x => x && x.reason && Number.isFinite(Number(x.amount)) && Number(x.amount) > 0)
+    .filter(x =>
+      x &&
+      x.reason &&
+      ['IN', 'OUT'].includes(String(x.type || '').toUpperCase()) &&
+      Number.isFinite(Number(x.amount)) &&
+      Number(x.amount) > 0
+    )
     .map(x => ({
       reason: String(x.reason).trim(),
-      type: String(x.type || '').toUpperCase() === 'OUT' ? 'OUT' : 'IN',
+      type: String(x.type).toUpperCase(),
       amount: Math.round(Number(x.amount) * 100) / 100
     }));
 
-  if (!totals) return { complete: false, items: list };
+  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
+    ? Number(totals.count)
+    : null;
 
-  const expectedCount = Number.isFinite(Number(totals.count)) ? Number(totals.count) : null;
-  const totalIn = Number.isFinite(Number(totals.totalPayIn)) ? Number(totals.totalPayIn) : null;
-  const totalOut = Number.isFinite(Number(totals.totalPayOut)) ? Number(totals.totalPayOut) : null;
-  const net = Number.isFinite(Number(totals.netInflow)) ? Number(totals.netInflow) : null;
+  // Main Phase25 rule: strict "(IN)/(OUT)" rows + printed count are authoritative.
+  if (expectedCount !== null && list.length === expectedCount) {
+    // Optional amount repair when there is exactly one IN and one OUT and printed totals are clear.
+    if (
+      expectedCount === 2 &&
+      Number.isFinite(Number(totals?.totalPayIn)) &&
+      Number.isFinite(Number(totals?.totalPayOut))
+    ) {
+      const inRows = list.filter(x => x.type === 'IN');
+      const outRows = list.filter(x => x.type === 'OUT');
 
-  // Easy zero case.
-  if ((expectedCount === 0 || expectedCount == null) && totalIn === 0 && totalOut === 0) {
+      if (inRows.length === 1 && outRows.length === 1) {
+        inRows[0].amount = Math.round(Number(totals.totalPayIn) * 100) / 100;
+        outRows[0].amount = Math.round(Number(totals.totalPayOut) * 100) / 100;
+      }
+    }
+    return { complete: true, items: list, repaired: true };
+  }
+
+  if (expectedCount === 0 && list.length === 0) {
     return { complete: true, items: [] };
   }
 
-  // If the printed count says exactly 2 and we have exactly 2 named rows,
-  // use the printed IN/OUT totals to repair OCR amounts/types instead of asking for another photo.
-  if (expectedCount === 2 && list.length === 2 && totalIn != null && totalOut != null) {
-    const a = { ...list[0] };
-    const b = { ...list[1] };
-
-    // Preserve explicit types when they are different.
-    if (a.type !== b.type) {
-      const inItem = a.type === 'IN' ? a : b;
-      const outItem = a.type === 'OUT' ? a : b;
-      inItem.amount = Math.round(totalIn * 100) / 100;
-      outItem.amount = Math.round(totalOut * 100) / 100;
-
-      const repaired = [a, b];
-      const repairedNet = Math.round(
-        (repaired.filter(x => x.type === 'IN').reduce((sum,x)=>sum+x.amount,0) -
-         repaired.filter(x => x.type === 'OUT').reduce((sum,x)=>sum+x.amount,0)) * 100
-      ) / 100;
-
-      if (net == null || Math.abs(repairedNet - net) <= 0.02) {
-        return { complete: true, items: repaired, repaired: true };
-      }
-    }
-
-    // If OCR lost one/both type markers, infer by matching the printed totals to the two amounts.
-    const amounts = [a.amount, b.amount];
-    const directMatch =
-      Math.abs(amounts[0] - totalIn) <= 0.02 && Math.abs(amounts[1] - totalOut) <= 0.02;
-    const reverseMatch =
-      Math.abs(amounts[1] - totalIn) <= 0.02 && Math.abs(amounts[0] - totalOut) <= 0.02;
-
-    if (directMatch || reverseMatch) {
-      if (directMatch) {
-        a.type = 'IN'; b.type = 'OUT';
-      } else {
-        a.type = 'OUT'; b.type = 'IN';
-      }
-      return { complete: true, items: [a, b], repaired: true };
-    }
-  }
-
-  // Generic exact validation.
-  const inSum = Math.round(list.filter(x => x.type === 'IN').reduce((sum,x)=>sum+x.amount,0)*100)/100;
-  const outSum = Math.round(list.filter(x => x.type === 'OUT').reduce((sum,x)=>sum+x.amount,0)*100)/100;
-  const calcNet = Math.round((inSum - outSum)*100)/100;
-
-  const countOk = expectedCount == null || list.length === expectedCount;
-  const inOk = totalIn == null || Math.abs(inSum-totalIn) <= 0.02;
-  const outOk = totalOut == null || Math.abs(outSum-totalOut) <= 0.02;
-  const netOk = net == null || Math.abs(calcNet-net) <= 0.02;
-
-  return { complete: countOk && inOk && outOk && netOk, items: list };
+  return { complete: false, items: list };
 }
 
 module.exports = {
