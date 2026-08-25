@@ -93,7 +93,7 @@ function fieldPrompt(field, data = {}) {
       const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
       const got = items.length;
       const need = totals.count != null ? ` (${got}/${totals.count} lines read)` : '';
-      return `Pay In/Out එකේ තව line එකක් පැහැදිලි නැහැ${need}. අදාළ Reason + Amount + IN/OUT පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න.`;
+      return `Pay In/Out එකේ තව line එකක් පැහැදිලි නැහැ${need}. Reason + Amount + (IN/OUT) පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න. උදා: (OUT) Rusiru Advance 21000.00`;
     }
     default:
       return 'Read නොවුණු පොඩි කොටස විතරක් ලඟින් photo එකක් එවන්න.';
