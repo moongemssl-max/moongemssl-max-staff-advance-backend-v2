@@ -526,57 +526,56 @@ async function downloadWhatsAppImage(mediaId) {
 }
 
 async function buildOcrVariants(imageBuffer) {
-  const metadata = await sharp(imageBuffer).rotate().metadata();
-  const width = metadata.width || 1200;
-  const height = metadata.height || 1600;
+  const meta = await sharp(imageBuffer).rotate().metadata();
+  const width = Math.max(1, meta.width || 1200);
+  const height = Math.max(1, meta.height || 1600);
 
-  const upscaleWidth = Math.min(Math.max(Math.round(width * 2.5), 1800), 3000);
-  const base = (input) => input
+  // Phase 17: keep OCR memory/CPU bounded. Phase 16 ran 20+ Tesseract passes and could
+  // restart a small Render instance before WhatsApp received a reply.
+  const targetWidth = Math.min(Math.max(Math.round(width * 1.8), 1600), 2400);
+  const enhance = (input) => input
     .rotate()
     .grayscale()
     .normalize()
-    .sharpen({ sigma: 1.4 })
-    .resize({ width: upscaleWidth, withoutEnlargement: false });
+    .resize({ width: targetWidth, withoutEnlargement: false })
+    .sharpen({ sigma: 1.15 });
 
-  // Top 22% is where "Branch:" is printed on these Shift Summary receipts.
-  const topHeight = Math.max(1, Math.floor(height * 0.22));
-  const topSource = () => sharp(imageBuffer).rotate().extract({ left: 0, top: 0, width, height: topHeight });
+  // Never create a tiny/invalid crop. Tesseract may otherwise emit
+  // "Image too small to scale" / "Line cannot be recognized" warnings.
+  const safeCrop = (topRatio, heightRatio) => {
+    const top = Math.max(0, Math.min(height - 1, Math.floor(height * topRatio)));
+    const cropHeight = Math.max(8, Math.min(height - top, Math.floor(height * heightRatio)));
+    if (width < 8 || cropHeight < 8) return null;
+    return sharp(imageBuffer).rotate().extract({ left: 0, top, width, height: cropHeight });
+  };
 
-  const topNormal = await base(topSource()).png().toBuffer();
-  const topHighContrast = await base(topSource()).linear(1.55, -35).png().toBuffer();
-  const topThreshold = await base(topSource()).threshold(178).png().toBuffer();
-  const topThresholdLight = await base(topSource()).threshold(205).png().toBuffer();
+  const branchSource = safeCrop(0, 0.28);
+  const drawerSource = safeCrop(0.42, 0.48);
 
-  // Cash Drawer position varies with receipt length (refund/credit sections add height),
-  // so OCR several overlapping middle/lower crops instead of relying on one fixed crop.
-  const drawerCrops = [
-    [0.42, 0.46],
-    [0.50, 0.42],
-    [0.58, 0.34]
-  ];
-  const drawerVariants = [];
-  for (const [topRatio, heightRatio] of drawerCrops) {
-    const cropTop = Math.max(0, Math.floor(height * topRatio));
-    const cropHeight = Math.max(1, Math.min(height - cropTop, Math.floor(height * heightRatio)));
-    const crop = () => sharp(imageBuffer).rotate().extract({ left: 0, top: cropTop, width, height: cropHeight });
-    drawerVariants.push(await base(crop()).png().toBuffer());
-    drawerVariants.push(await base(crop()).linear(1.5, -30).png().toBuffer());
-    drawerVariants.push(await base(crop()).threshold(185).png().toBuffer());
+  const branch = [];
+  if (branchSource) {
+    branch.push(await enhance(branchSource).linear(1.35, -18).png().toBuffer());
+    const branchSource2 = safeCrop(0, 0.28);
+    if (branchSource2) branch.push(await enhance(branchSource2).threshold(195).png().toBuffer());
   }
 
-  const full = await base(sharp(imageBuffer)).png().toBuffer();
-  const fullHighContrast = await base(sharp(imageBuffer)).linear(1.45, -25).png().toBuffer();
-  const fullThreshold = await base(sharp(imageBuffer)).threshold(188).png().toBuffer();
-  const fullThresholdLight = await base(sharp(imageBuffer)).threshold(205).png().toBuffer();
+  const drawer = [];
+  if (drawerSource) {
+    drawer.push(await enhance(drawerSource).linear(1.35, -18).png().toBuffer());
+    const drawerSource2 = safeCrop(0.42, 0.48);
+    if (drawerSource2) drawer.push(await enhance(drawerSource2).threshold(195).png().toBuffer());
+  }
 
-  return {
-    branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
-    drawer: drawerVariants,
-    full: [full, fullHighContrast, fullThreshold, fullThresholdLight]
-  };
+  // Full-receipt fallback also carries Pay In/Out text. Two variants are enough; avoid the
+  // Phase 16 four-variant x two-PSM multiplication that was expensive on Render.
+  const fullNormal = await enhance(sharp(imageBuffer)).linear(1.25, -12).png().toBuffer();
+  const fullThreshold = await enhance(sharp(imageBuffer)).threshold(195).png().toBuffer();
+
+  return { branch, drawer, full: [fullNormal, fullThreshold] };
 }
 
 async function recognizeVariants(worker, variants, pageSegMode) {
+  if (!variants?.length) return [];
   await worker.setParameters({
     tessedit_pageseg_mode: String(pageSegMode),
     preserve_interword_spaces: '1'
@@ -584,8 +583,15 @@ async function recognizeVariants(worker, variants, pageSegMode) {
 
   const texts = [];
   for (const variant of variants) {
-    const result = await worker.recognize(variant);
-    texts.push(result?.data?.text || '');
+    try {
+      const metadata = await sharp(variant).metadata();
+      if ((metadata.width || 0) < 8 || (metadata.height || 0) < 8) continue;
+      const result = await worker.recognize(variant);
+      texts.push(result?.data?.text || '');
+    } catch (error) {
+      // One bad OCR pass must not prevent the employee receiving a reply.
+      console.warn('OCR variant skipped:', error.message);
+    }
   }
   return texts;
 }
@@ -595,13 +601,12 @@ async function recognizeReceipt(imageBuffer) {
     const worker = await getSharedWorker();
     const variants = await buildOcrVariants(imageBuffer);
 
-    // PSM 6 works much better for the small, single receipt block at the top/drawer.
+    console.log('Shift OCR: branch pass');
     const branchTexts = await recognizeVariants(worker, variants.branch, 6);
+    console.log('Shift OCR: drawer pass');
     const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
-    // PSM 3 is kept as a general fallback for the whole receipt.
-    const fullTextsPsm3 = await recognizeVariants(worker, variants.full, 3);
-    const fullTextsPsm6 = await recognizeVariants(worker, variants.full, 6);
-    const fullTexts = [...fullTextsPsm3, ...fullTextsPsm6];
+    console.log('Shift OCR: full pass');
+    const fullTexts = await recognizeVariants(worker, variants.full, 6);
 
     const branchText = branchTexts.join('\n');
     const drawerText = drawerTexts.join('\n');
@@ -611,15 +616,12 @@ async function recognizeReceipt(imageBuffer) {
     const branchLines = branchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const allLines = combinedText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
-    // Branch is resolved from the dedicated top crop first, then all OCR text as fallback.
     let branchInfo = extractBranch(branchLines);
     if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
     const drawerValues = findDrawerValues(allLines);
     let chosen = chooseActualEndingCash(drawerValues);
 
-    // Strong fallback: independently read the labelled Actual Ending Cash row from every OCR pass.
-    // This prevents a clear receipt being rejected merely because the generic drawer parser missed one label.
     if (chosen.amount === null) {
       const directCandidates = [...drawerTexts, ...fullTexts]
         .map(extractActualEndingCashFromText)
@@ -657,10 +659,6 @@ async function recognizeReceipt(imageBuffer) {
     }
 
     const balance = calculateBalance(chosen.amount);
-
-    // Difference is taken from the printed Difference row only. We deliberately do not
-    // calculate it from Expected Ending Cash because a single OCR error there can create a
-    // confident-looking but wrong Difference value.
     const resolvedDifference = resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
 
     return {
@@ -672,8 +670,9 @@ async function recognizeReceipt(imageBuffer) {
       difference: resolvedDifference,
       amountSource: chosen.source,
       drawerValues,
-      payInOutText: fullTexts[0] || fullText || combinedText,
-      text: combinedText
+      payInOutText: fullText || combinedText,
+      text: combinedText,
+      ocrMode: 'phase17_bounded_ocr'
     };
   });
 }
