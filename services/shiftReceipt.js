@@ -576,132 +576,89 @@ async function buildOcrVariants(imageBuffer) {
   };
 }
 
-async function buildRecoveryOcrVariants(imageBuffer) {
-  const metadata = await sharp(imageBuffer).rotate().metadata();
-  const width = metadata.width || 1200;
-  const height = metadata.height || 1600;
-  const targetWidth = Math.min(Math.max(Math.round(width * 3.2), 2200), 3600);
+async function buildLightRecoveryVariants(imageBuffer) {
+  const meta = await sharp(imageBuffer).rotate().metadata();
+  const width = meta.width || 1200;
+  const height = meta.height || 1600;
+  const outWidth = Math.min(Math.max(width * 2, 1400), 2000);
 
-  const enhance = (input) => input
-    .rotate()
-    .grayscale()
-    .normalize()
-    .resize({ width: targetWidth, withoutEnlargement: false })
-    .sharpen({ sigma: 1.8 });
-
-  const makeCrop = (topRatio, heightRatio) => {
+  const safeCrop = async (topRatio, heightRatio) => {
     const top = Math.max(0, Math.floor(height * topRatio));
-    const cropHeight = Math.max(1, Math.min(height - top, Math.floor(height * heightRatio)));
-    return () => sharp(imageBuffer).rotate().extract({
-      left: 0,
-      top,
-      width,
-      height: cropHeight
-    });
+    const cropHeight = Math.max(40, Math.min(height - top, Math.floor(height * heightRatio)));
+    if (width < 40 || cropHeight < 40) return null;
+    return sharp(imageBuffer)
+      .rotate()
+      .extract({ left: 0, top, width, height: cropHeight })
+      .grayscale()
+      .normalize()
+      .resize({ width: outWidth, withoutEnlargement: false })
+      .sharpen()
+      .png()
+      .toBuffer();
   };
 
-  // Branch recovery: slightly larger top area than the normal pass.
-  const branchSource = makeCrop(0, 0.32);
-  const branch = [
-    await enhance(branchSource()).png().toBuffer(),
-    await enhance(branchSource()).linear(1.7, -45).png().toBuffer(),
-    await enhance(branchSource()).threshold(170).png().toBuffer(),
-    await enhance(branchSource()).threshold(195).png().toBuffer(),
-    await enhance(branchSource()).threshold(215).png().toBuffer()
-  ];
+  const branch = await safeCrop(0.00, 0.30);
+  const cash1 = await safeCrop(0.48, 0.34);
+  const cash2 = await safeCrop(0.62, 0.32);
 
-  // Actual Ending Cash recovery:
-  // receipt length varies, so slide overlapping crops through the entire middle/lower receipt.
-  const drawer = [];
-  const windows = [
-    [0.28, 0.30],
-    [0.36, 0.30],
-    [0.44, 0.30],
-    [0.52, 0.30],
-    [0.60, 0.30],
-    [0.68, 0.28]
-  ];
-
-  for (const [topRatio, heightRatio] of windows) {
-    const source = makeCrop(topRatio, heightRatio);
-    drawer.push(await enhance(source()).png().toBuffer());
-    drawer.push(await enhance(source()).linear(1.65, -40).png().toBuffer());
-    drawer.push(await enhance(source()).threshold(175).png().toBuffer());
-    drawer.push(await enhance(source()).threshold(200).png().toBuffer());
-  }
-
-  return { branch, drawer };
+  return {
+    branch: branch ? [branch] : [],
+    cash: [cash1, cash2].filter(Boolean)
+  };
 }
 
-function consensusMoney(values, minimumVotes = 2) {
-  const clean = (values || []).filter((v) => v !== null && Number.isFinite(Number(v)));
-  if (!clean.length) return null;
+async function lightRecoverMissingFields(worker, imageBuffer, branch, actualEndingCash) {
+  const variants = await buildLightRecoveryVariants(imageBuffer);
+  let recoveredBranch = branch || null;
+  let recoveredBranchRaw = null;
+  let recoveredCash = Number.isFinite(Number(actualEndingCash))
+    ? Number(actualEndingCash)
+    : null;
+  let text = "";
 
-  const counts = new Map();
-  for (const value of clean) {
-    const key = Number(value).toFixed(2);
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-
-  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  if (!ranked.length || ranked[0][1] < minimumVotes) return null;
-
-  // If two different values have the same top vote count, do not guess.
-  if (ranked[1] && ranked[1][1] === ranked[0][1] && ranked[1][0] !== ranked[0][0]) {
-    return null;
-  }
-
-  return Number(ranked[0][0]);
-}
-
-async function recoverMissingReceiptFields(worker, imageBuffer, currentBranch, currentActual) {
-  const variants = await buildRecoveryOcrVariants(imageBuffer);
-  let branch = currentBranch || null;
-  let branchRaw = null;
-  let actualEndingCash = Number.isFinite(Number(currentActual)) ? Number(currentActual) : null;
-  let recoveryText = '';
-
-  if (!branch) {
-    const branchPsm6 = await recognizeVariants(worker, variants.branch, 6);
-    const branchPsm11 = await recognizeVariants(worker, variants.branch, 11);
-    const texts = [...branchPsm6, ...branchPsm11];
-    recoveryText += texts.join('\n');
-
-    const candidates = [];
-    for (const text of texts) {
+  // One extra branch pass only.
+  if (!recoveredBranch && variants.branch.length) {
+    const texts = await recognizeVariants(worker, variants.branch, 6);
+    text += texts.join("\n");
+    for (const t of texts) {
       const info = extractBranch(
-        String(text || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+        String(t || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean)
       );
-      if (info.branch) candidates.push(info);
-    }
-
-    const counts = new Map();
-    for (const item of candidates) {
-      counts.set(item.branch, (counts.get(item.branch) || 0) + 1);
-    }
-    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-    if (ranked[0] && ranked[0][1] >= 2) {
-      branch = ranked[0][0];
-      branchRaw = candidates.find((x) => x.branch === branch)?.branchRaw || null;
+      if (info.branch) {
+        recoveredBranch = info.branch;
+        recoveredBranchRaw = info.branchRaw || info.branch;
+        break;
+      }
     }
   }
 
-  if (actualEndingCash === null) {
-    const drawerPsm6 = await recognizeVariants(worker, variants.drawer, 6);
-    const drawerPsm11 = await recognizeVariants(worker, variants.drawer, 11);
-    const texts = [...drawerPsm6, ...drawerPsm11];
-    recoveryText += '\n' + texts.join('\n');
-
-    // Only labelled "Actual Ending Cash" readers are allowed in recovery.
-    // Never use Sales/Card/Credit or an arbitrary large number as a fallback.
-    const candidates = texts
+  // Two cash crops, one OCR mode. Accept only labelled Actual Ending Cash.
+  if (recoveredCash === null && variants.cash.length) {
+    const texts = await recognizeVariants(worker, variants.cash, 6);
+    text += "\n" + texts.join("\n");
+    const values = texts
       .map(extractActualEndingCashFromText)
-      .filter((v) => v !== null);
+      .filter(v => v !== null && Number.isFinite(Number(v)));
 
-    actualEndingCash = consensusMoney(candidates, 2);
+    if (values.length) {
+      // If both crops produce values, require agreement. If only one crop
+      // contains the labelled line, accept that labelled result.
+      if (values.length === 1) {
+        recoveredCash = Number(values[0]);
+      } else {
+        const a = Number(values[0]).toFixed(2);
+        const same = values.every(v => Number(v).toFixed(2) === a);
+        if (same) recoveredCash = Number(values[0]);
+      }
+    }
   }
 
-  return { branch, branchRaw, actualEndingCash, text: recoveryText };
+  return {
+    branch: recoveredBranch,
+    branchRaw: recoveredBranchRaw,
+    actualEndingCash: recoveredCash,
+    text
+  };
 }
 
 async function recognizeVariants(worker, variants, pageSegMode) {
@@ -764,10 +721,10 @@ async function recognizeReceipt(imageBuffer) {
       }
     }
 
-    // Second-stage recovery runs ONLY when the normal Phase16 pass missed a critical field.
-    // Existing successful receipts keep the original fast path unchanged.
+    // LIGHT recovery: only when the original Phase16 pass missed Branch or Actual Ending Cash.
+    // Kept deliberately small for Render memory/CPU limits.
     if (!branchInfo.branch || chosen.amount === null) {
-      const recovered = await recoverMissingReceiptFields(
+      const recovered = await lightRecoverMissingFields(
         worker,
         imageBuffer,
         branchInfo.branch,
@@ -784,14 +741,12 @@ async function recognizeReceipt(imageBuffer) {
       if (chosen.amount === null && recovered.actualEndingCash !== null) {
         chosen = {
           amount: recovered.actualEndingCash,
-          source: 'recovery_label_consensus'
+          source: 'light_recovery_label'
         };
         drawerValues.actualEndingCash = recovered.actualEndingCash;
       }
 
-      if (recovered.text) {
-        combinedText += '\n' + recovered.text;
-      }
+      if (recovered.text) combinedText += '\n' + recovered.text;
     }
 
     if (!branchInfo.branch) {
@@ -829,9 +784,6 @@ async function recognizeReceipt(imageBuffer) {
       balance,
       difference: resolvedDifference,
       amountSource: chosen.source,
-      ocrMode: chosen.source === 'recovery_label_consensus'
-        ? 'phase16_recovery_consensus'
-        : 'phase16_original',
       drawerValues,
       payInOutText: fullTexts[0] || fullText || combinedText,
       text: combinedText
