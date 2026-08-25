@@ -123,19 +123,22 @@ function detectKnownBranch(value) {
   const text = String(value || '');
   const compact = compactLetters(text);
 
-  // Known printed names / common OCR variations for the two shops.
   const getahettaAliases = [
-    'getahetta', 'getahetta', 'getahatta', 'gettahetta', 'getaheta',
-    'getaherta', 'getaherta', 'getahetra', 'getahetta'
+    'getahetta', 'getahatta', 'gettahetta', 'getaheta', 'getaherta',
+    'getahetra', 'getaheta', 'getahetta', 'getahetta', 'getahett'
   ];
-  if (getahettaAliases.some((alias) => compact.includes(alias)) || fuzzyContains(text, 'getahetta', 3)) {
-    return 'GETAHETTA';
-  }
+  if (
+    getahettaAliases.some((alias) => compact.includes(alias)) ||
+    fuzzyContains(text, 'getahetta', 3) ||
+    fuzzyContains(text, 'getahetta', 3)
+  ) return 'GETAHETTA';
 
-  // "Main Branch" is short and OCR normally reads at least one of these words.
-  if (compact.includes('mainbranch') || compact.includes('main') || fuzzyContains(text, 'main', 1)) {
-    return 'MAIN';
-  }
+  const mainAliases = ['mainbranch', 'mainbranc', 'mainbrnch', 'mainbran', 'main'];
+  if (
+    mainAliases.some((alias) => compact.includes(alias)) ||
+    fuzzyContains(text, 'mainbranch', 3) ||
+    fuzzyContains(text, 'main', 1)
+  ) return 'MAIN';
 
   return null;
 }
@@ -1023,83 +1026,186 @@ function detectPayDirection(line, amount) {
   return 'IN';
 }
 
-function extractPayInOutItems(text, reasons = []) {
-  const configured = Array.from(new Set((reasons || [])
-    .map((value) => String(value || '').trim())
-    .filter(Boolean)));
-  if (!configured.length) return [];
-
+function extractPayInOutItems(text, configuredReasons = []) {
   const lines = String(text || '')
     .split(/\r?\n/)
     .map((line) => normalizeLine(line))
     .filter(Boolean);
 
+  const configured = (configuredReasons || [])
+    .map((reason) => String(reason || '').trim())
+    .filter(Boolean);
+
   const found = [];
   const seen = new Set();
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const lineKey = normalizeReasonKey(line);
+  function normalizeReasonKey(value) {
+    return compactLetters(String(value || ''))
+      .replace(/advance$/i, 'advance')
+      .replace(/battery/g, 'battry');
+  }
 
-    // Exact configured names always win. This is important for intentionally separate names
-    // such as "Poltel" and "Petrol", which are too similar for a blind fuzzy match.
-    let matches = configured.filter((reason) => lineKey.includes(normalizeReasonKey(reason)));
-    if (!matches.length) {
-      const fuzzy = configured.filter((reason) => reasonMatchesLine(line, reason));
-      // If OCR makes two configured names equally plausible, skip instead of categorising wrongly.
-      if (fuzzy.length === 1) matches = fuzzy;
+  function canonicalReason(raw) {
+    const key = normalizeReasonKey(raw);
+    if (!key) return null;
+
+    // Prefer configured names first.
+    const exact = configured.find((reason) => {
+      const rk = normalizeReasonKey(reason);
+      return key.includes(rk) || rk.includes(key);
+    });
+    if (exact) return exact;
+
+    const builtin = [
+      'Hadunkuru','Poltel','Petrol','Adu','Wedi','Battry','Bill Payment',
+      'Rusiru Advance','Prasanna Advance','Nandasena Advance'
+    ];
+    const fuzzy = builtin.find((reason) => {
+      const rk = normalizeReasonKey(reason);
+      return key.includes(rk) || rk.includes(key) || fuzzyContains(raw, reason, 3);
+    });
+    return fuzzy || raw.trim();
+  }
+
+  function explicitType(line) {
+    if (/\(\s*out\s*\)/i.test(line) || /\bout\b/i.test(line)) return 'OUT';
+    if (/\(\s*in\s*\)/i.test(line) || /\bin\b/i.test(line)) return 'IN';
+    return null;
+  }
+
+  // Strong direct parse:
+  // "(OUT) Rusiru Advance 21000.00"
+  // "(IN) Wedi 34.00"
+  const directPattern = /^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+?)\s+(-?[0-9OoIl|BS][0-9OoIl|BS,.\s]*[0-9OoIl|BS])\s*$/i;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const compact = similarityText(line);
+
+    if (
+      compact.includes('payinpayoutcount') ||
+      compact.includes('totalpayin') ||
+      compact.includes('totalpayout') ||
+      compact.includes('netinflow') ||
+      compact.includes('payinpayout')
+    ) continue;
+
+    let type = explicitType(line);
+    let reasonRaw = '';
+    let amount = null;
+
+    const direct = line.match(directPattern);
+    if (direct) {
+      type = direct[1].toUpperCase();
+      reasonRaw = direct[2].trim();
+      amount = parseMoney(direct[3]);
     }
-    if (!matches.length) continue;
 
-    const reason = matches.sort((a, b) => normalizeReasonKey(b).length - normalizeReasonKey(a).length)[0];
-    let amount = extractLastMoney(line);
-    let sourceLine = line;
-    if (amount === null) {
-      // Some thermal receipts split reason and amount/type onto the next line.
-      for (const nextIndex of [index + 1, index - 1]) {
-        if (nextIndex < 0 || nextIndex >= lines.length) continue;
-        const candidate = lines[nextIndex];
-        const candidateKey = normalizeReasonKey(candidate);
-        if (configured.some((other) => other !== reason && candidateKey.includes(normalizeReasonKey(other)))) continue;
-        const candidateAmount = extractLastMoney(candidate);
-        if (candidateAmount !== null) {
-          amount = candidateAmount;
-          sourceLine = `${line} ${candidate}`;
+    // If direct pattern failed, still accept explicit IN/OUT + last money.
+    if (!direct && type) {
+      amount = extractLastMoney(line);
+      if (amount !== null) {
+        reasonRaw = line
+          .replace(/\(\s*(?:IN|OUT)\s*\)/ig, ' ')
+          .replace(/\b(?:IN|OUT)\b/ig, ' ')
+          .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+    }
+
+    // Split line fallback: type+reason on one line, amount on next.
+    if (type && amount === null) {
+      reasonRaw = line
+        .replace(/\(\s*(?:IN|OUT)\s*\)/ig, ' ')
+        .replace(/\b(?:IN|OUT)\b/ig, ' ')
+        .trim();
+
+      for (const j of [i + 1, i - 1]) {
+        if (j < 0 || j >= lines.length) continue;
+        const neighbour = lines[j];
+        const nc = similarityText(neighbour);
+        if (
+          nc.includes('totalpay') ||
+          nc.includes('netinflow') ||
+          nc.includes('payinpayoutcount')
+        ) continue;
+
+        const candidate = extractLastMoney(neighbour);
+        if (candidate !== null) {
+          amount = candidate;
           break;
         }
       }
     }
-    if (amount === null || !Number.isFinite(amount) || amount === 0) continue;
 
-    const type = detectPayDirection(sourceLine, amount);
-    const absoluteAmount = Math.round(Math.abs(Number(amount)) * 100) / 100;
-    if (absoluteAmount <= 0 || absoluteAmount > 1000000) continue;
+    if (!type || amount === null || !Number.isFinite(Number(amount))) continue;
 
-    const key = `${index}:${normalizeReasonKey(reason)}:${absoluteAmount.toFixed(2)}:${type}`;
+    const absolute = Math.round(Math.abs(Number(amount)) * 100) / 100;
+    if (!(absolute > 0 && absolute <= 1000000)) continue;
+
+    const reason = canonicalReason(reasonRaw);
+    if (!reason || reason.length < 2) continue;
+
+    const key = `${type}|${normalizeReasonKey(reason)}|${absolute.toFixed(2)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    found.push({ reason, amount: absoluteAmount, type });
+    found.push({ reason, amount: absolute, type });
   }
 
   return found;
 }
 
 function extractPayTotalsAndCount(text) {
-  const lines = String(text || '').split(/\r?\n/).map(normalizeLine).filter(Boolean);
-  const result = { totalPayIn: null, totalPayOut: null, count: null };
-  for (const line of lines) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map(normalizeLine)
+    .filter(Boolean);
+
+  const result = {
+    totalPayIn: null,
+    totalPayOut: null,
+    count: null,
+    netInflow: null
+  };
+
+  function valueFor(index) {
+    const direct = extractLastMoney(lines[index]);
+    if (direct !== null) return direct;
+    for (const j of [index + 1, index - 1]) {
+      if (j < 0 || j >= lines.length) continue;
+      const c = similarityText(lines[j]);
+      if (
+        c.includes('totalpayin') ||
+        c.includes('totalpayout') ||
+        c.includes('netinflow') ||
+        c.includes('payinpayoutcount')
+      ) continue;
+      const v = extractLastMoney(lines[j]);
+      if (v !== null) return v;
+    }
+    return null;
+  }
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
     const c = similarityText(line);
+
     if (c.includes('payinpayoutcount') || (c.includes('pay') && c.includes('count'))) {
-      const v = extractLastMoney(line);
+      const v = valueFor(i);
       if (v !== null && v >= 0 && v < 100) result.count = Math.round(v);
     } else if (c.includes('totalpayin')) {
-      const v = extractLastMoney(line);
-      if (v !== null) result.totalPayIn = Math.abs(v);
+      const v = valueFor(i);
+      if (v !== null) result.totalPayIn = Math.round(Math.abs(v) * 100) / 100;
     } else if (c.includes('totalpayout')) {
-      const v = extractLastMoney(line);
-      if (v !== null) result.totalPayOut = Math.abs(v);
+      const v = valueFor(i);
+      if (v !== null) result.totalPayOut = Math.round(Math.abs(v) * 100) / 100;
+    } else if (c.includes('netinflow')) {
+      const v = valueFor(i);
+      if (v !== null) result.netInflow = Math.round(Number(v) * 100) / 100;
     }
   }
+
   return result;
 }
 
@@ -1116,18 +1222,35 @@ function mergeUniquePayItems(existing, incoming) {
 
 function payItemsComplete(items, totals) {
   const list = Array.isArray(items) ? items : [];
-  const inSum = Math.round(list.filter(x => String(x.type).toUpperCase() === 'IN').reduce((a,x)=>a+Number(x.amount||0),0)*100)/100;
-  const outSum = Math.round(list.filter(x => String(x.type).toUpperCase() === 'OUT').reduce((a,x)=>a+Number(x.amount||0),0)*100)/100;
-  const countOk = totals?.count == null || list.length >= totals.count;
-  const inOk = totals?.totalPayIn == null || Math.abs(inSum - Number(totals.totalPayIn)) <= 0.02;
-  const outOk = totals?.totalPayOut == null || Math.abs(outSum - Number(totals.totalPayOut)) <= 0.02;
+  const inSum = Math.round(
+    list.filter(x => String(x.type).toUpperCase() === 'IN')
+      .reduce((a, x) => a + Number(x.amount || 0), 0) * 100
+  ) / 100;
+  const outSum = Math.round(
+    list.filter(x => String(x.type).toUpperCase() === 'OUT')
+      .reduce((a, x) => a + Number(x.amount || 0), 0) * 100
+  ) / 100;
+  const net = Math.round((inSum - outSum) * 100) / 100;
 
-  // If both printed totals are exactly zero, there are no rows to recover.
-  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0) return true;
+  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0 && (totals?.count == null || totals.count === 0)) {
+    return true;
+  }
 
-  // Need at least one reliable printed control (count or a total) before declaring complete.
-  const hasControl = totals && (totals.count != null || totals.totalPayIn != null || totals.totalPayOut != null);
-  return Boolean(hasControl && countOk && inOk && outOk);
+  const controls = [
+    totals?.count != null,
+    totals?.totalPayIn != null,
+    totals?.totalPayOut != null,
+    totals?.netInflow != null
+  ].filter(Boolean).length;
+
+  if (controls < 2) return false;
+
+  const countOk = totals.count == null || list.length === Number(totals.count);
+  const inOk = totals.totalPayIn == null || Math.abs(inSum - Number(totals.totalPayIn)) <= 0.02;
+  const outOk = totals.totalPayOut == null || Math.abs(outSum - Number(totals.totalPayOut)) <= 0.02;
+  const netOk = totals.netInflow == null || Math.abs(net - Number(totals.netInflow)) <= 0.02;
+
+  return countOk && inOk && outOk && netOk;
 }
 
 async function recognizeReceiptField(imageBuffer, field, configuredReasons = []) {
@@ -1149,10 +1272,43 @@ async function recognizeReceiptField(imageBuffer, field, configuredReasons = [])
     if (field === 'actual_ending_cash') {
       const labelled = extractActualEndingCashFromText(text);
       const strict = strictActualFromDrawerBlock(lines);
-      const amount = normalizeActualEndingCashCandidate(labelled ?? strict.amount);
-      return { success: amount !== null, field, actualEndingCash: amount, drawerValues: strict.values, text };
-    }
+      const loose = findDrawerValues(lines);
 
+      const candidates = [
+        labelled,
+        strict.amount,
+        strict.values?.actualEndingCash,
+        loose?.actualEndingCash
+      ]
+        .map(normalizeActualEndingCashCandidate)
+        .filter((v) => v !== null);
+
+      let amount = candidates.length ? candidates[0] : null;
+
+      // Prefer a candidate consistent with Expected + Difference = Actual.
+      const expected = strict.values?.expectedEndingCash ?? loose?.expectedEndingCash ?? null;
+      const difference = strict.values?.difference ?? loose?.difference ?? null;
+      if (expected !== null && difference !== null) {
+        const mathActual = Math.round((Number(expected) + Number(difference)) * 100) / 100;
+        const normalizedMath = normalizeActualEndingCashCandidate(mathActual);
+        if (normalizedMath !== null) {
+          const matching = candidates.find((v) => Math.abs(v - normalizedMath) <= 2);
+          amount = matching ?? normalizedMath;
+        }
+      }
+
+      return {
+        success: amount !== null,
+        field,
+        actualEndingCash: amount,
+        drawerValues: {
+          ...(loose || {}),
+          ...(strict.values || {}),
+          actualEndingCash: amount
+        },
+        text
+      };
+    }
     if (field === 'difference') {
       const direct = extractStrictDifferenceFromText(text);
       const drawer = findStrictDrawerValues(lines);
