@@ -16,7 +16,8 @@ const {
   recognizeReceiptField,
   extractPayTotalsAndCount,
   mergeUniquePayItems,
-  payItemsComplete
+  payItemsComplete,
+  reconcilePayItemsWithTotals
 } = require('../services/shiftReceipt');
 
 const router = express.Router();
@@ -74,7 +75,8 @@ function requiredField(data) {
   const totals = data?.payTotals || null;
   const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
   if (!totals || (totals.count == null && totals.totalPayIn == null && totals.totalPayOut == null)) return 'pay_totals';
-  if (!payItemsComplete(items, totals)) return 'pay_line';
+  const reconciled = reconcilePayItemsWithTotals(items, totals);
+  if (!reconciled.complete) return 'pay_line';
   return null;
 }
 
@@ -264,13 +266,19 @@ async function processShiftReceiptImage(message, senderNumber) {
         Array.isArray(merged.payInOutItems) &&
         merged.payInOutItems.length > Number(merged.payTotals.count)
       ) {
-        // Do not keep stale OCR rows from older attempts. Prefer only a set that validates
-        // against the printed count/totals; otherwise wait for the requested close-up.
         const expectedCount = Number(merged.payTotals.count);
         const possible = merged.payInOutItems.slice(-expectedCount);
         if (payItemsComplete(possible, merged.payTotals)) {
           merged.payInOutItems = possible;
         }
+      }
+
+      const reconciledPay = reconcilePayItemsWithTotals(
+        merged.payInOutItems || [],
+        merged.payTotals || null
+      );
+      if (reconciledPay.complete) {
+        merged.payInOutItems = reconciledPay.items;
       }
 
       const next = requiredField(merged);
@@ -347,6 +355,14 @@ async function processShiftReceiptImage(message, senderNumber) {
       payTotals: initialTotals,
       retryMessageIds: []
     };
+
+    const initialReconciledPay = reconcilePayItemsWithTotals(
+      session.payInOutItems || [],
+      session.payTotals || null
+    );
+    if (initialReconciledPay.complete) {
+      session.payInOutItems = initialReconciledPay.items;
+    }
 
     const missing = requiredField(session);
     if (missing) {
