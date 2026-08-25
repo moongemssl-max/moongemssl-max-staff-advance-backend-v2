@@ -78,6 +78,42 @@ function requiredField(data) {
   return null;
 }
 
+function payItemScore(items, totals) {
+  const list = Array.isArray(items) ? items : [];
+  const inSum = Math.round(
+    list.filter(x => String(x.type || '').toUpperCase() === 'IN')
+      .reduce((sum, x) => sum + Number(x.amount || 0), 0) * 100
+  ) / 100;
+  const outSum = Math.round(
+    list.filter(x => String(x.type || '').toUpperCase() === 'OUT')
+      .reduce((sum, x) => sum + Number(x.amount || 0), 0) * 100
+  ) / 100;
+
+  let score = 0;
+  if (totals?.count != null && list.length === Number(totals.count)) score += 4;
+  if (totals?.totalPayIn != null && Math.abs(inSum - Number(totals.totalPayIn)) <= 0.02) score += 3;
+  if (totals?.totalPayOut != null && Math.abs(outSum - Number(totals.totalPayOut)) <= 0.02) score += 3;
+  if (totals?.netInflow != null && Math.abs((inSum - outSum) - Number(totals.netInflow)) <= 0.02) score += 2;
+  return score;
+}
+
+function chooseBestPayItems(existingItems, newItems, totals) {
+  const existing = Array.isArray(existingItems) ? existingItems : [];
+  const incoming = Array.isArray(newItems) ? newItems : [];
+  const merged = mergeUniquePayItems(existing, incoming);
+
+  const candidates = [existing, incoming, merged]
+    .filter(list => list.length > 0)
+    .map(list => ({ list, score: payItemScore(list, totals) }))
+    .sort((a, b) => b.score - a.score || a.list.length - b.list.length);
+
+  // Important: if the new close-up itself matches printed Count/Totals,
+  // discard stale rows saved by an older OCR attempt.
+  if (incoming.length && payItemsComplete(incoming, totals)) return incoming;
+
+  return candidates[0]?.list || [];
+}
+
 function fieldPrompt(field, data = {}) {
   switch (field) {
     case 'branch':
@@ -92,7 +128,10 @@ function fieldPrompt(field, data = {}) {
       const totals = data?.payTotals || {};
       const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
       const got = items.length;
-      const need = totals.count != null ? ` (${got}/${totals.count} lines read)` : '';
+      const expected = totals.count != null ? Number(totals.count) : null;
+      const need = expected != null
+        ? (got <= expected ? ` (${got}/${expected} lines read)` : ` (${expected} expected; OCR mismatch)`)
+        : '';
       return `Pay In/Out එකේ තව line එකක් පැහැදිලි නැහැ${need}. Reason + Amount + (IN/OUT) පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න. උදා: (OUT) Rusiru Advance 21000.00`;
     }
     default:
@@ -213,7 +252,25 @@ async function processShiftReceiptImage(message, senderNumber) {
       } else if (field === 'pay_totals' && partial.success) {
         merged.payTotals = { ...(merged.payTotals || {}), ...(partial.totals || {}) };
       } else if (field === 'pay_line' && partial.success) {
-        merged.payInOutItems = mergeUniquePayItems(merged.payInOutItems || [], partial.items || []);
+        merged.payInOutItems = chooseBestPayItems(
+          merged.payInOutItems || [],
+          partial.items || [],
+          merged.payTotals || null
+        );
+      }
+
+      if (
+        merged.payTotals?.count != null &&
+        Array.isArray(merged.payInOutItems) &&
+        merged.payInOutItems.length > Number(merged.payTotals.count)
+      ) {
+        // Do not keep stale OCR rows from older attempts. Prefer only a set that validates
+        // against the printed count/totals; otherwise wait for the requested close-up.
+        const expectedCount = Number(merged.payTotals.count);
+        const possible = merged.payInOutItems.slice(-expectedCount);
+        if (payItemsComplete(possible, merged.payTotals)) {
+          merged.payInOutItems = possible;
+        }
       }
 
       const next = requiredField(merged);
