@@ -123,22 +123,19 @@ function detectKnownBranch(value) {
   const text = String(value || '');
   const compact = compactLetters(text);
 
+  // Known printed names / common OCR variations for the two shops.
   const getahettaAliases = [
-    'getahetta', 'getahatta', 'gettahetta', 'getaheta', 'getaherta',
-    'getahetra', 'getaheta', 'getahetta', 'getahetta', 'getahett'
+    'getahetta', 'getahetta', 'getahatta', 'gettahetta', 'getaheta',
+    'getaherta', 'getaherta', 'getahetra', 'getahetta'
   ];
-  if (
-    getahettaAliases.some((alias) => compact.includes(alias)) ||
-    fuzzyContains(text, 'getahetta', 3) ||
-    fuzzyContains(text, 'getahetta', 3)
-  ) return 'GETAHETTA';
+  if (getahettaAliases.some((alias) => compact.includes(alias)) || fuzzyContains(text, 'getahetta', 3)) {
+    return 'GETAHETTA';
+  }
 
-  const mainAliases = ['mainbranch', 'mainbranc', 'mainbrnch', 'mainbran', 'main'];
-  if (
-    mainAliases.some((alias) => compact.includes(alias)) ||
-    fuzzyContains(text, 'mainbranch', 3) ||
-    fuzzyContains(text, 'main', 1)
-  ) return 'MAIN';
+  // "Main Branch" is short and OCR normally reads at least one of these words.
+  if (compact.includes('mainbranch') || compact.includes('main') || fuzzyContains(text, 'main', 1)) {
+    return 'MAIN';
+  }
 
   return null;
 }
@@ -206,147 +203,6 @@ function findNearbyMoney(lines, index, maxDistance = 2) {
   }
 
   return null;
-}
-
-
-function isCashDrawerHeading(line) {
-  const normalized = normalizeLine(line);
-  return looksLike(normalized, ['cash', 'drawer']) ||
-    lineHasFuzzyWords(normalized, ['cash', 'drawer'], 2) ||
-    (fuzzyContains(normalized, 'cash', 2) && fuzzyContains(normalized, 'drawer', 3));
-}
-
-function isDrawerEndHeading(line) {
-  const compact = similarityText(line);
-  return compact.includes('audit') || fuzzyContains(line, 'audit', 2) ||
-    compact.includes('firstreceipt') || compact.includes('lastreceipt');
-}
-
-function getCashDrawerBlock(lines) {
-  const normalized = (lines || []).map((line) => normalizeLine(line)).filter(Boolean);
-  const start = normalized.findIndex(isCashDrawerHeading);
-  if (start < 0) return [];
-
-  const block = [];
-  for (let index = start + 1; index < Math.min(normalized.length, start + 18); index += 1) {
-    const line = normalized[index];
-    if (isDrawerEndHeading(line)) break;
-    block.push(line);
-  }
-  return block;
-}
-
-function moneyOnlyLine(line) {
-  const cleaned = normalizeLine(line);
-  if (!cleaned) return null;
-  const textWithoutMoney = cleaned.replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?/g, ' ')
-    .replace(/[.\-: ]/g, '')
-    .trim();
-  if (textWithoutMoney.length > 2) return null;
-  return extractLastMoney(cleaned);
-}
-
-function findStrictDrawerValues(lines) {
-  const block = getCashDrawerBlock(lines);
-  const values = {
-    startingCash: null,
-    netCashInflow: null,
-    expectedEndingCash: null,
-    actualEndingCash: null,
-    difference: null
-  };
-  if (!block.length) return { values, block, confidence: 0 };
-
-  const labelDefinitions = [
-    ['startingCash', ['starting', 'cash']],
-    ['netCashInflow', ['net', 'cash', 'inflow']],
-    ['expectedEndingCash', ['expected', 'ending', 'cash']],
-    ['actualEndingCash', ['actual', 'ending', 'cash']],
-    ['difference', ['difference']]
-  ];
-
-  let labelledCount = 0;
-  for (let index = 0; index < block.length; index += 1) {
-    const line = block[index];
-    for (const [field, words] of labelDefinitions) {
-      if (values[field] !== null) continue;
-      const matched = words.length === 1
-        ? fuzzyContains(line, words[0], 3)
-        : lineHasFuzzyWords(line, words, 3);
-      if (!matched) continue;
-
-      let amount = extractLastMoney(line);
-      if (amount === null) {
-        for (let offset = 1; offset <= 2; offset += 1) {
-          const next = block[index + offset];
-          if (!next) break;
-          const anotherLabel = labelDefinitions.some(([, checkWords]) =>
-            checkWords.length === 1 ? fuzzyContains(next, checkWords[0], 2) : lineHasFuzzyWords(next, checkWords, 2)
-          );
-          if (anotherLabel) break;
-          amount = moneyOnlyLine(next);
-          if (amount !== null) break;
-        }
-      }
-      if (amount !== null) {
-        values[field] = amount;
-        labelledCount += 1;
-      }
-    }
-  }
-
-  // Strong sequence fallback is allowed ONLY inside the Cash Drawer block and only if drawer math agrees.
-  if (values.actualEndingCash === null) {
-    const numericRows = [];
-    for (const line of block) {
-      const amount = extractLastMoney(line);
-      if (amount !== null) numericRows.push(amount);
-    }
-    for (let start = 0; start + 4 < numericRows.length; start += 1) {
-      const [starting, inflow, expected, actual, difference] = numericRows.slice(start, start + 5);
-      const expectedMath = Math.round((starting + inflow) * 100) / 100;
-      const actualMath = Math.round((expected + difference) * 100) / 100;
-      if (
-        starting >= 0 && starting < 50000 && inflow >= 0 && inflow < 2000000 &&
-        expected >= 4000 && expected < 2000000 && actual >= 4000 && actual < 2000000 &&
-        Math.abs(expectedMath - expected) <= 2 && Math.abs(actualMath - actual) <= 2 &&
-        Math.abs(difference) <= 10000
-      ) {
-        if (values.startingCash === null) values.startingCash = starting;
-        if (values.netCashInflow === null) values.netCashInflow = inflow;
-        if (values.expectedEndingCash === null) values.expectedEndingCash = expected;
-        values.actualEndingCash = actual;
-        if (values.difference === null) values.difference = difference;
-        break;
-      }
-    }
-  }
-
-  if (values.difference === null && values.actualEndingCash !== null && values.expectedEndingCash !== null) {
-    const derived = Math.round((values.actualEndingCash - values.expectedEndingCash) * 100) / 100;
-    if (Math.abs(derived) <= 10000) values.difference = derived;
-  }
-
-  let confidence = 0;
-  if (values.actualEndingCash !== null) confidence += 4;
-  if (values.expectedEndingCash !== null) confidence += 2;
-  if (values.startingCash !== null) confidence += 1;
-  if (values.netCashInflow !== null) confidence += 1;
-  if (values.difference !== null) confidence += 1;
-  confidence += Math.min(labelledCount, 3);
-  return { values, block, confidence };
-}
-
-function strictActualFromDrawerBlock(lines) {
-  const result = findStrictDrawerValues(lines);
-  const raw = result.values.actualEndingCash;
-  const normalized = normalizeActualEndingCashCandidate(raw);
-  return {
-    amount: normalized,
-    values: result.values,
-    block: result.block,
-    confidence: result.confidence
-  };
 }
 
 function findDrawerValues(lines) {
@@ -670,56 +526,185 @@ async function downloadWhatsAppImage(mediaId) {
 }
 
 async function buildOcrVariants(imageBuffer) {
-  const meta = await sharp(imageBuffer).rotate().metadata();
-  const width = Math.max(1, meta.width || 1200);
-  const height = Math.max(1, meta.height || 1600);
+  const metadata = await sharp(imageBuffer).rotate().metadata();
+  const width = metadata.width || 1200;
+  const height = metadata.height || 1600;
 
-  // Phase 17: keep OCR memory/CPU bounded. Phase 16 ran 20+ Tesseract passes and could
-  // restart a small Render instance before WhatsApp received a reply.
-  const targetWidth = Math.min(Math.max(Math.round(width * 1.8), 1600), 2400);
+  const upscaleWidth = Math.min(Math.max(Math.round(width * 2.5), 1800), 3000);
+  const base = (input) => input
+    .rotate()
+    .grayscale()
+    .normalize()
+    .sharpen({ sigma: 1.4 })
+    .resize({ width: upscaleWidth, withoutEnlargement: false });
+
+  // Top 22% is where "Branch:" is printed on these Shift Summary receipts.
+  const topHeight = Math.max(1, Math.floor(height * 0.22));
+  const topSource = () => sharp(imageBuffer).rotate().extract({ left: 0, top: 0, width, height: topHeight });
+
+  const topNormal = await base(topSource()).png().toBuffer();
+  const topHighContrast = await base(topSource()).linear(1.55, -35).png().toBuffer();
+  const topThreshold = await base(topSource()).threshold(178).png().toBuffer();
+  const topThresholdLight = await base(topSource()).threshold(205).png().toBuffer();
+
+  // Cash Drawer position varies with receipt length (refund/credit sections add height),
+  // so OCR several overlapping middle/lower crops instead of relying on one fixed crop.
+  const drawerCrops = [
+    [0.42, 0.46],
+    [0.50, 0.42],
+    [0.58, 0.34]
+  ];
+  const drawerVariants = [];
+  for (const [topRatio, heightRatio] of drawerCrops) {
+    const cropTop = Math.max(0, Math.floor(height * topRatio));
+    const cropHeight = Math.max(1, Math.min(height - cropTop, Math.floor(height * heightRatio)));
+    const crop = () => sharp(imageBuffer).rotate().extract({ left: 0, top: cropTop, width, height: cropHeight });
+    drawerVariants.push(await base(crop()).png().toBuffer());
+    drawerVariants.push(await base(crop()).linear(1.5, -30).png().toBuffer());
+    drawerVariants.push(await base(crop()).threshold(185).png().toBuffer());
+  }
+
+  const full = await base(sharp(imageBuffer)).png().toBuffer();
+  const fullHighContrast = await base(sharp(imageBuffer)).linear(1.45, -25).png().toBuffer();
+  const fullThreshold = await base(sharp(imageBuffer)).threshold(188).png().toBuffer();
+  const fullThresholdLight = await base(sharp(imageBuffer)).threshold(205).png().toBuffer();
+
+  return {
+    branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
+    drawer: drawerVariants,
+    full: [full, fullHighContrast, fullThreshold, fullThresholdLight]
+  };
+}
+
+async function buildRecoveryOcrVariants(imageBuffer) {
+  const metadata = await sharp(imageBuffer).rotate().metadata();
+  const width = metadata.width || 1200;
+  const height = metadata.height || 1600;
+  const targetWidth = Math.min(Math.max(Math.round(width * 3.2), 2200), 3600);
+
   const enhance = (input) => input
     .rotate()
     .grayscale()
     .normalize()
     .resize({ width: targetWidth, withoutEnlargement: false })
-    .sharpen({ sigma: 1.15 });
+    .sharpen({ sigma: 1.8 });
 
-  // Never create a tiny/invalid crop. Tesseract may otherwise emit
-  // "Image too small to scale" / "Line cannot be recognized" warnings.
-  const safeCrop = (topRatio, heightRatio) => {
-    const top = Math.max(0, Math.min(height - 1, Math.floor(height * topRatio)));
-    const cropHeight = Math.max(8, Math.min(height - top, Math.floor(height * heightRatio)));
-    if (width < 8 || cropHeight < 8) return null;
-    return sharp(imageBuffer).rotate().extract({ left: 0, top, width, height: cropHeight });
+  const makeCrop = (topRatio, heightRatio) => {
+    const top = Math.max(0, Math.floor(height * topRatio));
+    const cropHeight = Math.max(1, Math.min(height - top, Math.floor(height * heightRatio)));
+    return () => sharp(imageBuffer).rotate().extract({
+      left: 0,
+      top,
+      width,
+      height: cropHeight
+    });
   };
 
-  const branchSource = safeCrop(0, 0.28);
-  const drawerSource = safeCrop(0.42, 0.48);
+  // Branch recovery: slightly larger top area than the normal pass.
+  const branchSource = makeCrop(0, 0.32);
+  const branch = [
+    await enhance(branchSource()).png().toBuffer(),
+    await enhance(branchSource()).linear(1.7, -45).png().toBuffer(),
+    await enhance(branchSource()).threshold(170).png().toBuffer(),
+    await enhance(branchSource()).threshold(195).png().toBuffer(),
+    await enhance(branchSource()).threshold(215).png().toBuffer()
+  ];
 
-  const branch = [];
-  if (branchSource) {
-    branch.push(await enhance(branchSource).linear(1.35, -18).png().toBuffer());
-    const branchSource2 = safeCrop(0, 0.28);
-    if (branchSource2) branch.push(await enhance(branchSource2).threshold(195).png().toBuffer());
-  }
-
+  // Actual Ending Cash recovery:
+  // receipt length varies, so slide overlapping crops through the entire middle/lower receipt.
   const drawer = [];
-  if (drawerSource) {
-    drawer.push(await enhance(drawerSource).linear(1.35, -18).png().toBuffer());
-    const drawerSource2 = safeCrop(0.42, 0.48);
-    if (drawerSource2) drawer.push(await enhance(drawerSource2).threshold(195).png().toBuffer());
+  const windows = [
+    [0.28, 0.30],
+    [0.36, 0.30],
+    [0.44, 0.30],
+    [0.52, 0.30],
+    [0.60, 0.30],
+    [0.68, 0.28]
+  ];
+
+  for (const [topRatio, heightRatio] of windows) {
+    const source = makeCrop(topRatio, heightRatio);
+    drawer.push(await enhance(source()).png().toBuffer());
+    drawer.push(await enhance(source()).linear(1.65, -40).png().toBuffer());
+    drawer.push(await enhance(source()).threshold(175).png().toBuffer());
+    drawer.push(await enhance(source()).threshold(200).png().toBuffer());
   }
 
-  // Full-receipt fallback also carries Pay In/Out text. Two variants are enough; avoid the
-  // Phase 16 four-variant x two-PSM multiplication that was expensive on Render.
-  const fullNormal = await enhance(sharp(imageBuffer)).linear(1.25, -12).png().toBuffer();
-  const fullThreshold = await enhance(sharp(imageBuffer)).threshold(195).png().toBuffer();
+  return { branch, drawer };
+}
 
-  return { branch, drawer, full: [fullNormal, fullThreshold] };
+function consensusMoney(values, minimumVotes = 2) {
+  const clean = (values || []).filter((v) => v !== null && Number.isFinite(Number(v)));
+  if (!clean.length) return null;
+
+  const counts = new Map();
+  for (const value of clean) {
+    const key = Number(value).toFixed(2);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (!ranked.length || ranked[0][1] < minimumVotes) return null;
+
+  // If two different values have the same top vote count, do not guess.
+  if (ranked[1] && ranked[1][1] === ranked[0][1] && ranked[1][0] !== ranked[0][0]) {
+    return null;
+  }
+
+  return Number(ranked[0][0]);
+}
+
+async function recoverMissingReceiptFields(worker, imageBuffer, currentBranch, currentActual) {
+  const variants = await buildRecoveryOcrVariants(imageBuffer);
+  let branch = currentBranch || null;
+  let branchRaw = null;
+  let actualEndingCash = Number.isFinite(Number(currentActual)) ? Number(currentActual) : null;
+  let recoveryText = '';
+
+  if (!branch) {
+    const branchPsm6 = await recognizeVariants(worker, variants.branch, 6);
+    const branchPsm11 = await recognizeVariants(worker, variants.branch, 11);
+    const texts = [...branchPsm6, ...branchPsm11];
+    recoveryText += texts.join('\n');
+
+    const candidates = [];
+    for (const text of texts) {
+      const info = extractBranch(
+        String(text || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+      );
+      if (info.branch) candidates.push(info);
+    }
+
+    const counts = new Map();
+    for (const item of candidates) {
+      counts.set(item.branch, (counts.get(item.branch) || 0) + 1);
+    }
+    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    if (ranked[0] && ranked[0][1] >= 2) {
+      branch = ranked[0][0];
+      branchRaw = candidates.find((x) => x.branch === branch)?.branchRaw || null;
+    }
+  }
+
+  if (actualEndingCash === null) {
+    const drawerPsm6 = await recognizeVariants(worker, variants.drawer, 6);
+    const drawerPsm11 = await recognizeVariants(worker, variants.drawer, 11);
+    const texts = [...drawerPsm6, ...drawerPsm11];
+    recoveryText += '\n' + texts.join('\n');
+
+    // Only labelled "Actual Ending Cash" readers are allowed in recovery.
+    // Never use Sales/Card/Credit or an arbitrary large number as a fallback.
+    const candidates = texts
+      .map(extractActualEndingCashFromText)
+      .filter((v) => v !== null);
+
+    actualEndingCash = consensusMoney(candidates, 2);
+  }
+
+  return { branch, branchRaw, actualEndingCash, text: recoveryText };
 }
 
 async function recognizeVariants(worker, variants, pageSegMode) {
-  if (!variants?.length) return [];
   await worker.setParameters({
     tessedit_pageseg_mode: String(pageSegMode),
     preserve_interword_spaces: '1'
@@ -727,15 +712,8 @@ async function recognizeVariants(worker, variants, pageSegMode) {
 
   const texts = [];
   for (const variant of variants) {
-    try {
-      const metadata = await sharp(variant).metadata();
-      if ((metadata.width || 0) < 8 || (metadata.height || 0) < 8) continue;
-      const result = await worker.recognize(variant);
-      texts.push(result?.data?.text || '');
-    } catch (error) {
-      // One bad OCR pass must not prevent the employee receiving a reply.
-      console.warn('OCR variant skipped:', error.message);
-    }
+    const result = await worker.recognize(variant);
+    texts.push(result?.data?.text || '');
   }
   return texts;
 }
@@ -745,12 +723,13 @@ async function recognizeReceipt(imageBuffer) {
     const worker = await getSharedWorker();
     const variants = await buildOcrVariants(imageBuffer);
 
-    console.log('Shift OCR: branch pass');
+    // PSM 6 works much better for the small, single receipt block at the top/drawer.
     const branchTexts = await recognizeVariants(worker, variants.branch, 6);
-    console.log('Shift OCR: drawer pass');
     const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
-    console.log('Shift OCR: full pass');
-    const fullTexts = await recognizeVariants(worker, variants.full, 6);
+    // PSM 3 is kept as a general fallback for the whole receipt.
+    const fullTextsPsm3 = await recognizeVariants(worker, variants.full, 3);
+    const fullTextsPsm6 = await recognizeVariants(worker, variants.full, 6);
+    const fullTexts = [...fullTextsPsm3, ...fullTextsPsm6];
 
     const branchText = branchTexts.join('\n');
     const drawerText = drawerTexts.join('\n');
@@ -760,61 +739,58 @@ async function recognizeReceipt(imageBuffer) {
     const branchLines = branchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const allLines = combinedText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
+    // Branch is resolved from the dedicated top crop first, then all OCR text as fallback.
     let branchInfo = extractBranch(branchLines);
     if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
-    // PHASE 18 SAFETY RULE:
-    // Actual Ending Cash is NEVER allowed to come from Sales/Credit/Card/PayIn sections.
-    // It must be found inside a Cash Drawer block, or be confirmed by Cash Drawer math.
-    const drawerPassResults = drawerTexts.map((text) =>
-      strictActualFromDrawerBlock(text.split(/\r?\n/).filter(Boolean))
-    );
-    const fullPassResults = fullTexts.map((text) =>
-      strictActualFromDrawerBlock(text.split(/\r?\n/).filter(Boolean))
-    );
-    const strictResults = [...drawerPassResults, ...fullPassResults]
-      .filter((item) => item.amount !== null);
+    const drawerValues = findDrawerValues(allLines);
+    let chosen = chooseActualEndingCash(drawerValues);
 
-    let chosen = { amount: null, source: null };
-    let drawerValues = { startingCash: null, netCashInflow: null, expectedEndingCash: null, actualEndingCash: null, difference: null };
-    let drawerBlockPreview = '';
-
-    if (strictResults.length) {
-      const groups = new Map();
-      strictResults.forEach((item) => {
-        const key = Number(item.amount).toFixed(2);
-        const group = groups.get(key) || { count: 0, score: 0, best: item };
-        group.count += 1;
-        group.score += item.confidence;
-        if (item.confidence > group.best.confidence) group.best = item;
-        groups.set(key, group);
-      });
-
-      const ranked = [...groups.entries()].sort((a, b) => {
-        if (b[1].count !== a[1].count) return b[1].count - a[1].count;
-        return b[1].score - a[1].score;
-      });
-      const [key, winner] = ranked[0];
-      const candidate = Number(key);
-
-      // Require either agreement between OCR passes or a highly structured drawer read.
-      if (winner.count >= 2 || winner.best.confidence >= 8) {
-        chosen = {
-          amount: candidate,
-          source: winner.count >= 2 ? 'cash_drawer_consensus' : 'cash_drawer_high_confidence'
-        };
-        drawerValues = winner.best.values;
-        drawerBlockPreview = winner.best.block.join(' | ');
+    // Strong fallback: independently read the labelled Actual Ending Cash row from every OCR pass.
+    // This prevents a clear receipt being rejected merely because the generic drawer parser missed one label.
+    if (chosen.amount === null) {
+      const directCandidates = [...drawerTexts, ...fullTexts]
+        .map(extractActualEndingCashFromText)
+        .filter((value) => value !== null);
+      if (directCandidates.length) {
+        const counts = new Map();
+        for (const value of directCandidates) {
+          const key = Number(value).toFixed(2);
+          counts.set(key, (counts.get(key) || 0) + 1);
+        }
+        const best = Number([...counts.entries()].sort((a, b) => b[1] - a[1])[0][0]);
+        chosen = { amount: best, source: 'labelled_actual_ending_cash_fallback' };
+        drawerValues.actualEndingCash = best;
       }
     }
 
-    // Last safe fallback: parse the combined OCR, but still restrict extraction to Cash Drawer block only.
-    if (chosen.amount === null) {
-      const combinedStrict = strictActualFromDrawerBlock(allLines);
-      if (combinedStrict.amount !== null && combinedStrict.confidence >= 8) {
-        chosen = { amount: combinedStrict.amount, source: 'cash_drawer_combined_high_confidence' };
-        drawerValues = combinedStrict.values;
-        drawerBlockPreview = combinedStrict.block.join(' | ');
+    // Second-stage recovery runs ONLY when the normal Phase16 pass missed a critical field.
+    // Existing successful receipts keep the original fast path unchanged.
+    if (!branchInfo.branch || chosen.amount === null) {
+      const recovered = await recoverMissingReceiptFields(
+        worker,
+        imageBuffer,
+        branchInfo.branch,
+        chosen.amount
+      );
+
+      if (!branchInfo.branch && recovered.branch) {
+        branchInfo = {
+          branch: recovered.branch,
+          branchRaw: recovered.branchRaw || recovered.branch
+        };
+      }
+
+      if (chosen.amount === null && recovered.actualEndingCash !== null) {
+        chosen = {
+          amount: recovered.actualEndingCash,
+          source: 'recovery_label_consensus'
+        };
+        drawerValues.actualEndingCash = recovered.actualEndingCash;
+      }
+
+      if (recovered.text) {
+        combinedText += '\n' + recovered.text;
       }
     }
 
@@ -822,10 +798,6 @@ async function recognizeReceipt(imageBuffer) {
       return {
         success: false,
         reason: 'branch_not_found',
-        actualEndingCash: chosen.amount,
-        drawerValues,
-        difference: drawerValues.difference,
-        payInOutText: fullText || combinedText,
         text: combinedText,
         branchOcrPreview: branchLines.slice(0, 12).join(' | ')
       };
@@ -837,13 +809,17 @@ async function recognizeReceipt(imageBuffer) {
         reason: 'actual_ending_cash_not_found',
         branch: branchInfo.branch,
         drawerValues,
-        drawerOcrPreview: drawerBlockPreview || drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
+        drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
         text: combinedText
       };
     }
 
     const balance = calculateBalance(chosen.amount);
-    const resolvedDifference = drawerValues.difference !== null ? drawerValues.difference : resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
+
+    // Difference is taken from the printed Difference row only. We deliberately do not
+    // calculate it from Expected Ending Cash because a single OCR error there can create a
+    // confident-looking but wrong Difference value.
+    const resolvedDifference = resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
 
     return {
       success: true,
@@ -853,136 +829,14 @@ async function recognizeReceipt(imageBuffer) {
       balance,
       difference: resolvedDifference,
       amountSource: chosen.source,
+      ocrMode: chosen.source === 'recovery_label_consensus'
+        ? 'phase16_recovery_consensus'
+        : 'phase16_original',
       drawerValues,
-      payInOutText: fullText || combinedText,
-      text: combinedText,
-      ocrMode: 'phase18_strict_cash_drawer'
+      payInOutText: fullTexts[0] || fullText || combinedText,
+      text: combinedText
     };
   });
-}
-
-async function recognizeReceiptSection(imageBuffer, section) {
-  return runOcrExclusive(async () => {
-    const worker = await getSharedWorker();
-
-    const enhanced = await sharp(imageBuffer)
-      .rotate()
-      .grayscale()
-      .normalize()
-      .resize({ width: 2000, withoutEnlargement: false })
-      .sharpen({ sigma: 1.2 })
-      .linear(1.3, -15)
-      .png()
-      .toBuffer();
-
-    const thresholded = await sharp(imageBuffer)
-      .rotate()
-      .grayscale()
-      .normalize()
-      .resize({ width: 2000, withoutEnlargement: false })
-      .threshold(190)
-      .png()
-      .toBuffer();
-
-    const texts = await recognizeVariants(worker, [enhanced, thresholded], 6);
-    const text = texts.join('\n');
-    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-
-    if (section === 'branch') {
-      const branchInfo = extractBranch(lines);
-      return {
-        success: Boolean(branchInfo.branch),
-        section,
-        branch: branchInfo.branch,
-        branchRaw: branchInfo.branchRaw,
-        text
-      };
-    }
-
-    if (section === 'cash_drawer') {
-      // On a close-up retry, the employee is explicitly sending only the Cash Drawer section.
-      // Prefer strict Cash Drawer parsing, but if the heading is cropped off, allow labelled
-      // Actual/Expected/Difference lines from the whole close-up. Never use Sales/Card/Credit here.
-      const strict = strictActualFromDrawerBlock(lines);
-      let values = strict.values;
-      let actual = strict.amount;
-
-      if (actual === null) {
-        const loose = findDrawerValues(lines);
-        const labelledActual = extractActualEndingCashFromText(text);
-        values = {
-          startingCash: loose.startingCash,
-          netCashInflow: loose.netCashInflow,
-          expectedEndingCash: loose.expectedEndingCash,
-          actualEndingCash: labelledActual ?? loose.actualEndingCash,
-          difference: loose.difference
-        };
-        actual = normalizeActualEndingCashCandidate(values.actualEndingCash);
-      }
-
-      if (actual !== null && values.difference === null && values.expectedEndingCash !== null) {
-        const derived = Math.round((actual - values.expectedEndingCash) * 100) / 100;
-        if (Math.abs(derived) <= 10000) values.difference = derived;
-      }
-
-      return {
-        success: actual !== null,
-        section,
-        actualEndingCash: actual,
-        drawerValues: values,
-        difference: values.difference,
-        text
-      };
-    }
-
-    if (section === 'pay_in_out') {
-      return {
-        success: text.trim().length > 0,
-        section,
-        text
-      };
-    }
-
-    return { success: false, section, text };
-  });
-}
-
-function inspectPayInOutSection(text, items = []) {
-  const normalized = String(text || '').toLowerCase();
-  const compact = similarityText(normalized);
-  const hasSection = compact.includes('payinpayout') ||
-    compact.includes('payin') || compact.includes('payout');
-
-  const lines = String(text || '')
-    .split(/\r?\n/)
-    .map((line) => normalizeLine(line))
-    .filter(Boolean);
-
-  let totalPayIn = null;
-  let totalPayOut = null;
-
-  for (const line of lines) {
-    const compactLine = similarityText(line);
-    if (compactLine.includes('totalpayin')) {
-      const value = extractLastMoney(line);
-      if (value !== null) totalPayIn = Math.abs(value);
-    }
-    if (compactLine.includes('totalpayout')) {
-      const value = extractLastMoney(line);
-      if (value !== null) totalPayOut = Math.abs(value);
-    }
-  }
-
-  // Verified if we read at least one configured item, or the printed totals clearly say zero.
-  const zeroTotals = totalPayIn === 0 && totalPayOut === 0;
-  const verified = items.length > 0 || (hasSection && zeroTotals);
-
-  return {
-    verified,
-    hasSection,
-    totalPayIn,
-    totalPayOut
-  };
 }
 
 function calculateBringAmount(actualEndingCash, balance) {
@@ -990,12 +844,6 @@ function calculateBringAmount(actualEndingCash, balance) {
 }
 
 function buildReply(result) {
-  if (!Number.isFinite(result.actualEndingCash) || !Number.isFinite(result.balance)) {
-    throw new Error('Shift cash result is incomplete');
-  }
-  if (!(result.balance >= 4000 && result.balance < 5000)) {
-    throw new Error(`Shift cash remainder failed safety check: ${result.balance}`);
-  }
   const bringAmount = calculateBringAmount(result.actualEndingCash, result.balance);
   return `${result.branch} - Rs. ${formatMoney(result.balance)} අයින් කරලා, ඉතිරි Rs. ${formatMoney(bringAmount)} බාර දෙන්න.`;
 }
@@ -1026,293 +874,65 @@ function detectPayDirection(line, amount) {
   return 'IN';
 }
 
-function extractPayInOutItems(text, configuredReasons = []) {
-  // Keep raw OCR punctuation until AFTER we detect the transaction marker.
-  // normalizeLine() removes "(" and ")", so using it first breaks "(IN)/(OUT)" parsing.
-  const rawLines = String(text || '')
-    .split(/\r?\n/)
-    .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
+function extractPayInOutItems(text, reasons = []) {
+  const configured = Array.from(new Set((reasons || [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)));
+  if (!configured.length) return [];
 
-  const configured = (configuredReasons || [])
-    .map((reason) => String(reason || '').trim())
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => normalizeLine(line))
     .filter(Boolean);
 
   const found = [];
   const seen = new Set();
 
-  function reasonKey(value) {
-    return compactLetters(String(value || '')).replace(/battery/g, 'battry');
-  }
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lineKey = normalizeReasonKey(line);
 
-  function canonicalReason(raw) {
-    const cleaned = String(raw || '')
-      .replace(/[^a-zA-Z0-9 ]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
+    // Exact configured names always win. This is important for intentionally separate names
+    // such as "Poltel" and "Petrol", which are too similar for a blind fuzzy match.
+    let matches = configured.filter((reason) => lineKey.includes(normalizeReasonKey(reason)));
+    if (!matches.length) {
+      const fuzzy = configured.filter((reason) => reasonMatchesLine(line, reason));
+      // If OCR makes two configured names equally plausible, skip instead of categorising wrongly.
+      if (fuzzy.length === 1) matches = fuzzy;
+    }
+    if (!matches.length) continue;
 
-    const key = reasonKey(cleaned);
-    if (!key) return null;
+    const reason = matches.sort((a, b) => normalizeReasonKey(b).length - normalizeReasonKey(a).length)[0];
+    let amount = extractLastMoney(line);
+    let sourceLine = line;
+    if (amount === null) {
+      // Some thermal receipts split reason and amount/type onto the next line.
+      for (const nextIndex of [index + 1, index - 1]) {
+        if (nextIndex < 0 || nextIndex >= lines.length) continue;
+        const candidate = lines[nextIndex];
+        const candidateKey = normalizeReasonKey(candidate);
+        if (configured.some((other) => other !== reason && candidateKey.includes(normalizeReasonKey(other)))) continue;
+        const candidateAmount = extractLastMoney(candidate);
+        if (candidateAmount !== null) {
+          amount = candidateAmount;
+          sourceLine = `${line} ${candidate}`;
+          break;
+        }
+      }
+    }
+    if (amount === null || !Number.isFinite(amount) || amount === 0) continue;
 
-    const known = [
-      ...configured,
-      'Hadunkuru', 'Poltel', 'Petrol', 'Adu', 'Wedi', 'Battry',
-      'Bill Payment', 'Rusiru Advance', 'Prasanna Advance', 'Nandasena Advance'
-    ].filter(Boolean);
-
-    const exact = known.find((reason) => {
-      const rk = reasonKey(reason);
-      return key === rk || key.includes(rk) || rk.includes(key);
-    });
-    if (exact) return exact;
-
-    const fuzzy = known.find((reason) => fuzzyContains(cleaned, reason, 3));
-    return fuzzy || cleaned;
-  }
-
-  for (const rawLine of rawLines) {
-    // Transaction rows only.
-    // Printed form is "(IN) Reason 123.00" or "(OUT) Reason 123.00".
-    // OCR can lose a bracket, therefore accept only a LEADING IN/OUT marker.
-    // Summary rows such as Total Payin / Total Payout / Net Inflow can never match this.
-    const marker = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
-    if (!marker) continue;
-
-    const type = marker[1].toUpperCase();
-    const remainder = marker[2].trim();
-    const amount = extractLastMoney(remainder);
-
-    if (amount === null || !Number.isFinite(Number(amount))) continue;
-
-    const reasonRaw = remainder
-      .replace(/-?[$S]?\s*[0-9OoIl|BS][0-9OoIl|BS,.*\s-]*(?:[.,][0-9OoIl|BS]{1,2})?\s*$/i, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const reason = canonicalReason(reasonRaw);
-    if (!reason || reason.length < 2) continue;
-
+    const type = detectPayDirection(sourceLine, amount);
     const absoluteAmount = Math.round(Math.abs(Number(amount)) * 100) / 100;
-    if (!(absoluteAmount > 0 && absoluteAmount <= 1000000)) continue;
+    if (absoluteAmount <= 0 || absoluteAmount > 1000000) continue;
 
-    const key = `${type}|${reasonKey(reason)}|${absoluteAmount.toFixed(2)}`;
+    const key = `${index}:${normalizeReasonKey(reason)}:${absoluteAmount.toFixed(2)}:${type}`;
     if (seen.has(key)) continue;
     seen.add(key);
-
     found.push({ reason, amount: absoluteAmount, type });
   }
 
   return found;
-}
-
-function extractPayTotalsAndCount(text) {
-  const lines = String(text || '')
-    .split(/\r?\n/)
-    .map(normalizeLine)
-    .filter(Boolean);
-
-  const result = {
-    totalPayIn: null,
-    totalPayOut: null,
-    count: null,
-    netInflow: null
-  };
-
-  function valueFor(index) {
-    const direct = extractLastMoney(lines[index]);
-    if (direct !== null) return direct;
-    for (const j of [index + 1, index - 1]) {
-      if (j < 0 || j >= lines.length) continue;
-      const c = similarityText(lines[j]);
-      if (
-        c.includes('totalpayin') ||
-        c.includes('totalpayout') ||
-        c.includes('netinflow') ||
-        c.includes('payinpayoutcount')
-      ) continue;
-      const v = extractLastMoney(lines[j]);
-      if (v !== null) return v;
-    }
-    return null;
-  }
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const c = similarityText(line);
-
-    if (c.includes('payinpayoutcount') || (c.includes('pay') && c.includes('count'))) {
-      const v = valueFor(i);
-      if (v !== null && v >= 0 && v < 100) result.count = Math.round(v);
-    } else if (c.includes('totalpayin')) {
-      const v = valueFor(i);
-      if (v !== null) result.totalPayIn = Math.round(Math.abs(v) * 100) / 100;
-    } else if (c.includes('totalpayout')) {
-      const v = valueFor(i);
-      if (v !== null) result.totalPayOut = Math.round(Math.abs(v) * 100) / 100;
-    } else if (c.includes('netinflow')) {
-      const v = valueFor(i);
-      if (v !== null) result.netInflow = Math.round(Number(v) * 100) / 100;
-    }
-  }
-
-  return result;
-}
-
-function mergeUniquePayItems(existing, incoming) {
-  const all = [...(existing || []), ...(incoming || [])];
-  const seen = new Set();
-  return all.filter((item) => {
-    const key = `${String(item.reason || '').trim().toLowerCase()}|${String(item.type || '').toUpperCase()}|${Number(item.amount || 0).toFixed(2)}`;
-    if (!item.reason || !Number.isFinite(Number(item.amount)) || Number(item.amount) <= 0 || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-function payItemsComplete(items, totals) {
-  const list = Array.isArray(items) ? items : [];
-  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
-    ? Number(totals.count)
-    : null;
-
-  // If receipt explicitly printed Payin/Payout Count, that is the primary control.
-  // Since extractPayInOutItems now ONLY accepts rows beginning "(IN)" or "(OUT)",
-  // matching the printed count means all transaction rows were found.
-  if (expectedCount !== null) {
-    if (expectedCount === 0) return list.length === 0;
-    return list.length === expectedCount;
-  }
-
-  // If count was unreadable, zero totals still safely mean no Pay In/Out rows.
-  if (totals?.totalPayIn === 0 && totals?.totalPayOut === 0) {
-    return list.length === 0;
-  }
-
-  // Without a readable count, require at least one strict transaction row.
-  return list.length > 0;
-}
-
-async function recognizeReceiptField(imageBuffer, field, configuredReasons = []) {
-  return runOcrExclusive(async () => {
-    const worker = await getSharedWorker();
-    const variants = [
-      await sharp(imageBuffer).rotate().grayscale().normalize().resize({ width: 2200, withoutEnlargement: false }).sharpen({ sigma: 1.3 }).png().toBuffer(),
-      await sharp(imageBuffer).rotate().grayscale().normalize().resize({ width: 2200, withoutEnlargement: false }).threshold(185).png().toBuffer()
-    ];
-    const texts = await recognizeVariants(worker, variants, 6);
-    const text = texts.join('\n');
-    const lines = text.split(/\r?\n/).map(normalizeLine).filter(Boolean);
-
-    if (field === 'branch') {
-      const b = extractBranch(lines);
-      return { success: Boolean(b.branch), field, branch: b.branch, branchRaw: b.branchRaw, text };
-    }
-
-    if (field === 'actual_ending_cash') {
-      const labelled = extractActualEndingCashFromText(text);
-      const strict = strictActualFromDrawerBlock(lines);
-      const loose = findDrawerValues(lines);
-
-      const candidates = [
-        labelled,
-        strict.amount,
-        strict.values?.actualEndingCash,
-        loose?.actualEndingCash
-      ]
-        .map(normalizeActualEndingCashCandidate)
-        .filter((v) => v !== null);
-
-      let amount = candidates.length ? candidates[0] : null;
-
-      // Prefer a candidate consistent with Expected + Difference = Actual.
-      const expected = strict.values?.expectedEndingCash ?? loose?.expectedEndingCash ?? null;
-      const difference = strict.values?.difference ?? loose?.difference ?? null;
-      if (expected !== null && difference !== null) {
-        const mathActual = Math.round((Number(expected) + Number(difference)) * 100) / 100;
-        const normalizedMath = normalizeActualEndingCashCandidate(mathActual);
-        if (normalizedMath !== null) {
-          const matching = candidates.find((v) => Math.abs(v - normalizedMath) <= 2);
-          amount = matching ?? normalizedMath;
-        }
-      }
-
-      return {
-        success: amount !== null,
-        field,
-        actualEndingCash: amount,
-        drawerValues: {
-          ...(loose || {}),
-          ...(strict.values || {}),
-          actualEndingCash: amount
-        },
-        text
-      };
-    }
-    if (field === 'difference') {
-      const direct = extractStrictDifferenceFromText(text);
-      const drawer = findStrictDrawerValues(lines);
-      const value = direct ?? drawer.values.difference;
-      return { success: value !== null && Number.isFinite(Number(value)), field, difference: value, text };
-    }
-
-    if (field === 'pay_totals') {
-      const totals = extractPayTotalsAndCount(text);
-      const useful = totals.count != null || totals.totalPayIn != null || totals.totalPayOut != null;
-      return { success: useful, field, totals, text };
-    }
-
-    if (field === 'pay_line') {
-      const items = extractPayInOutItems(text, configuredReasons);
-      return { success: items.length > 0, field, items, text };
-    }
-
-    return { success: false, field, text };
-  });
-}
-
-function reconcilePayItemsWithTotals(items, totals) {
-  const list = (Array.isArray(items) ? items : [])
-    .filter(x =>
-      x &&
-      x.reason &&
-      ['IN', 'OUT'].includes(String(x.type || '').toUpperCase()) &&
-      Number.isFinite(Number(x.amount)) &&
-      Number(x.amount) > 0
-    )
-    .map(x => ({
-      reason: String(x.reason).trim(),
-      type: String(x.type).toUpperCase(),
-      amount: Math.round(Number(x.amount) * 100) / 100
-    }));
-
-  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
-    ? Number(totals.count)
-    : null;
-
-  // Main Phase25 rule: strict "(IN)/(OUT)" rows + printed count are authoritative.
-  if (expectedCount !== null && list.length === expectedCount) {
-    // Optional amount repair when there is exactly one IN and one OUT and printed totals are clear.
-    if (
-      expectedCount === 2 &&
-      Number.isFinite(Number(totals?.totalPayIn)) &&
-      Number.isFinite(Number(totals?.totalPayOut))
-    ) {
-      const inRows = list.filter(x => x.type === 'IN');
-      const outRows = list.filter(x => x.type === 'OUT');
-
-      if (inRows.length === 1 && outRows.length === 1) {
-        inRows[0].amount = Math.round(Number(totals.totalPayIn) * 100) / 100;
-        outRows[0].amount = Math.round(Number(totals.totalPayOut) * 100) / 100;
-      }
-    }
-    return { complete: true, items: list, repaired: true };
-  }
-
-  if (expectedCount === 0 && list.length === 0) {
-    return { complete: true, items: [] };
-  }
-
-  return { complete: false, items: list };
 }
 
 module.exports = {
@@ -1322,14 +942,5 @@ module.exports = {
   calculateBringAmount,
   buildReply,
   formatMoney,
-  extractPayInOutItems,
-  recognizeReceiptSection,
-  inspectPayInOutSection,
-  recognizeReceiptField,
-  extractPayTotalsAndCount,
-  mergeUniquePayItems,
-  payItemsComplete,
-  reconcilePayItemsWithTotals,
-  getCashDrawerBlock,
-  findStrictDrawerValues
+  extractPayInOutItems
 };
