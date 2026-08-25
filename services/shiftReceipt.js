@@ -1027,6 +1027,7 @@ function detectPayDirection(line, amount) {
 }
 
 function extractPayInOutItems(text, configuredReasons = []) {
+  // Do NOT normalize away "(" and ")" before checking the transaction marker.
   const rawLines = String(text || '')
     .split(/\r?\n/)
     .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
@@ -1069,13 +1070,15 @@ function extractPayInOutItems(text, configuredReasons = []) {
   }
 
   for (const rawLine of rawLines) {
-    const marker = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
-    if (!marker) continue;
+    // Only transaction rows beginning with IN/OUT are allowed.
+    // Brackets are preferred but OCR may drop one of them.
+    const match = rawLine.match(/^\s*\(?\s*(IN|OUT)\s*\)?\s+(.+)$/i);
+    if (!match) continue;
 
-    const type = marker[1].toUpperCase();
-    const remainder = marker[2].trim();
-
+    const type = match[1].toUpperCase();
+    const remainder = match[2].trim();
     const amount = extractLastMoney(remainder);
+
     if (amount === null || !Number.isFinite(Number(amount))) continue;
 
     const reasonRaw = remainder
@@ -1266,39 +1269,40 @@ async function recognizeReceiptField(imageBuffer, field, configuredReasons = [])
 
 function reconcilePayItemsWithTotals(items, totals) {
   const list = (Array.isArray(items) ? items : [])
-    .filter((x) =>
+    .filter(x =>
       x &&
       x.reason &&
       ['IN', 'OUT'].includes(String(x.type || '').toUpperCase()) &&
       Number.isFinite(Number(x.amount)) &&
       Number(x.amount) > 0
     )
-    .map((x) => ({
+    .map(x => ({
       reason: String(x.reason).trim(),
       type: String(x.type).toUpperCase(),
       amount: Math.round(Number(x.amount) * 100) / 100
     }));
 
-  const expectedCount =
-    totals?.count != null && Number.isFinite(Number(totals.count))
-      ? Number(totals.count)
-      : null;
+  const expectedCount = totals?.count != null && Number.isFinite(Number(totals.count))
+    ? Number(totals.count)
+    : null;
 
+  // Main Phase25 rule: strict "(IN)/(OUT)" rows + printed count are authoritative.
   if (expectedCount !== null && list.length === expectedCount) {
+    // Optional amount repair when there is exactly one IN and one OUT and printed totals are clear.
     if (
       expectedCount === 2 &&
       Number.isFinite(Number(totals?.totalPayIn)) &&
       Number.isFinite(Number(totals?.totalPayOut))
     ) {
-      const inRows = list.filter((x) => x.type === 'IN');
-      const outRows = list.filter((x) => x.type === 'OUT');
+      const inRows = list.filter(x => x.type === 'IN');
+      const outRows = list.filter(x => x.type === 'OUT');
 
       if (inRows.length === 1 && outRows.length === 1) {
         inRows[0].amount = Math.round(Number(totals.totalPayIn) * 100) / 100;
         outRows[0].amount = Math.round(Number(totals.totalPayOut) * 100) / 100;
       }
     }
-    return { complete: true, items: list };
+    return { complete: true, items: list, repaired: true };
   }
 
   if (expectedCount === 0 && list.length === 0) {
