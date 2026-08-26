@@ -1,0 +1,8 @@
+Phase 7 - Safe OCR + Difference Fix
+
+- Restores the proven Phase 5 multi-pass OCR/calculation path (no risky fast single-pass calculation).
+- Keeps one Tesseract worker warm to reduce repeated startup overhead.
+- Difference is read directly when possible and safely derived as Actual Ending Cash - Expected Ending Cash when needed.
+- WhatsApp reply wording: "... ඉතිරි Rs. X බාර දෙන්න."
+- Existing advance/text workflow is unchanged.
+- webhook/dashboard continue saving and returning Difference for Shift Cash History.

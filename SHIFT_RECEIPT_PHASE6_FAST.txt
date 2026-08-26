@@ -1,0 +1,12 @@
+Shift Receipt Phase 6 - Fast + Difference
+
+Changes:
+1. Keeps one Tesseract worker warm and reuses it between receipt photos.
+2. Runs one fast whole-receipt OCR pass first.
+3. Runs the existing strong multi-pass OCR only when the fast pass cannot safely resolve the receipt.
+4. Reads and stores the receipt Difference value.
+5. WhatsApp reply wording changed to: "ඉතිරි Rs. X බාර දෙන්න."
+6. Existing advance request workflow is unchanged.
+7. shift_cash_history now stores difference and ocrMode (fast/fallback).
+
+Deploy: replace the included backend files, commit to GitHub, and let Render deploy.

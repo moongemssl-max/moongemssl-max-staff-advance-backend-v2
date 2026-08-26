@@ -1,0 +1,20 @@
+# Shift Receipt Phase 17 - Branch Mapping + Sequential Manual Recovery
+
+Changes:
+- Branch is NOT read by OCR anymore.
+- Branch is selected from the employee WhatsApp number.
+- MAIN employees are configured with SHIFT_MAIN_EMPLOYEE_NUMBERS.
+- GETAHETTA employees are configured with SHIFT_GETAHETTA_EMPLOYEE_NUMBERS.
+- OCR focuses on Actual Ending Cash, Difference and Pay In/Out.
+- If Actual Ending Cash is unclear, ask only for Actual Ending Cash.
+- After Actual Ending Cash is supplied, if Difference is unclear, ask only for Difference.
+- Pay In/Out items are extracted from the readable receipt rows; they do not block the shift result.
+- If OCR cannot recover Actual Ending Cash, Difference and any Pay In/Out item, the original image is forwarded to SHIFT_ADMIN_WHATSAPP_NUMBER.
+- The employee is not asked to resend the same photo in that last-resort case.
+
+Required Render environment variables:
+SHIFT_MAIN_EMPLOYEE_NUMBERS=9477xxxxxxxx,9477xxxxxxxx
+SHIFT_GETAHETTA_EMPLOYEE_NUMBERS=9477xxxxxxxx
+SHIFT_ADMIN_WHATSAPP_NUMBER=9477xxxxxxxx
+
+Use international digits only (Sri Lanka: 9477..., not 077...).

@@ -1,0 +1,29 @@
+PHASE 5 - SHIFT CASH HISTORY
+
+What changed
+- Existing WhatsApp advance/text workflow is unchanged.
+- Existing receipt OCR logic is kept.
+- WhatsApp reply now includes both the remove amount and the amount to bring.
+  Example: GETAHETTA - Rs. 4,110 අයින් කරලා, ඉතිරි Rs. 40,000 රැගෙන එන්න.
+- Every successfully processed receipt is saved to Firestore collection: shift_cash_history.
+- Saved fields include date, branch, Actual Ending Cash, remove amount, bring amount, sender and reply text.
+- New API: GET /api/shift-cash-history?date=YYYY-MM-DD
+
+Deploy backend
+Upload/replace these files in the backend GitHub repository:
+- services/shiftReceipt.js
+- routes/webhook.js
+- routes/dashboard.js
+- server.js
+
+Then wait for Render to become Live.
+
+Android app
+The Android project includes a new Dashboard option: Shift Cash.
+It shows MAIN and GETAHETTA history for a selected date, including:
+- Actual Ending Cash
+- අයින් කරන ගාන
+- රැගෙන එන ගාන
+
+Important
+Only receipts processed after this backend version is deployed are automatically added to shift_cash_history.

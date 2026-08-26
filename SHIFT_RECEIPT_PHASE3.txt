@@ -1,0 +1,8 @@
+Shift Receipt Phase 3
+- Stronger Actual Ending Cash recognition.
+- OCRs several overlapping Cash Drawer crops because receipt length varies.
+- Uses normal, high-contrast, and threshold variants.
+- Fuzzy-matches Starting Cash / Net Cash Inflow / Expected Ending Cash / Actual Ending Cash / Difference.
+- Can read an amount from an adjacent OCR line when label and value split.
+- Can validate the five Cash Drawer rows by drawer arithmetic.
+- Existing WhatsApp text/advance flow is unchanged.
