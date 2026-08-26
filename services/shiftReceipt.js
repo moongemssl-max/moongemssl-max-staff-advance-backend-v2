@@ -595,20 +595,31 @@ async function recognizeReceipt(imageBuffer) {
     const worker = await getSharedWorker();
     const variants = await buildOcrVariants(imageBuffer);
 
-    // Branch is no longer OCR-read. The employee WhatsApp number determines the branch.
-    // OCR is focused only on the useful receipt data.
+    // PSM 6 works much better for the small, single receipt block at the top/drawer.
+    const branchTexts = await recognizeVariants(worker, variants.branch, 6);
     const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
+    // PSM 3 is kept as a general fallback for the whole receipt.
     const fullTextsPsm3 = await recognizeVariants(worker, variants.full, 3);
     const fullTextsPsm6 = await recognizeVariants(worker, variants.full, 6);
     const fullTexts = [...fullTextsPsm3, ...fullTextsPsm6];
+
+    const branchText = branchTexts.join('\n');
     const drawerText = drawerTexts.join('\n');
     const fullText = fullTexts.join('\n');
-    const combinedText = [drawerText, fullText].join('\n');
+    const combinedText = [branchText, drawerText, fullText].join('\n');
+
+    const branchLines = branchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const allLines = combinedText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+    // Branch is resolved from the dedicated top crop first, then all OCR text as fallback.
+    let branchInfo = extractBranch(branchLines);
+    if (!branchInfo.branch) branchInfo = extractBranch(allLines);
 
     const drawerValues = findDrawerValues(allLines);
     let chosen = chooseActualEndingCash(drawerValues);
 
+    // Strong fallback: independently read the labelled Actual Ending Cash row from every OCR pass.
+    // This prevents a clear receipt being rejected merely because the generic drawer parser missed one label.
     if (chosen.amount === null) {
       const directCandidates = [...drawerTexts, ...fullTexts]
         .map(extractActualEndingCashFromText)
@@ -625,21 +636,44 @@ async function recognizeReceipt(imageBuffer) {
       }
     }
 
+    if (!branchInfo.branch) {
+      return {
+        success: false,
+        reason: 'branch_not_found',
+        text: combinedText,
+        branchOcrPreview: branchLines.slice(0, 12).join(' | ')
+      };
+    }
+
+    if (chosen.amount === null) {
+      return {
+        success: false,
+        reason: 'actual_ending_cash_not_found',
+        branch: branchInfo.branch,
+        drawerValues,
+        drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 30).join(' | '),
+        text: combinedText
+      };
+    }
+
+    const balance = calculateBalance(chosen.amount);
+
+    // Difference is taken from the printed Difference row only. We deliberately do not
+    // calculate it from Expected Ending Cash because a single OCR error there can create a
+    // confident-looking but wrong Difference value.
     const resolvedDifference = resolveDifferenceFromPrintedLines(drawerTexts, drawerValues, chosen.amount);
-    const balance = chosen.amount === null ? null : calculateBalance(chosen.amount);
-    const reasonsText = fullTexts[0] || fullText || combinedText;
 
     return {
-      success: chosen.amount !== null,
-      reason: chosen.amount === null ? 'actual_ending_cash_not_found' : null,
+      success: true,
+      branch: branchInfo.branch,
+      branchRaw: branchInfo.branchRaw,
       actualEndingCash: chosen.amount,
       balance,
       difference: resolvedDifference,
       amountSource: chosen.source,
       drawerValues,
-      payInOutText: reasonsText,
-      text: combinedText,
-      drawerOcrPreview: drawerText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 40).join(' | ')
+      payInOutText: fullTexts[0] || fullText || combinedText,
+      text: combinedText
     };
   });
 }
