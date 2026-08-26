@@ -525,98 +525,154 @@ async function downloadWhatsAppImage(mediaId) {
   return buffer;
 }
 
-async function buildOcrVariants(imageBuffer) {
-  // IMPORTANT: apply EXIF rotation ONCE before reading width/height or calculating crops.
-  // Previously metadata could describe the unrotated phone photo while extract() ran after
-  // rotate(), which occasionally produced tiny strips such as 2x36 pixels.
-  const orientedBuffer = await sharp(imageBuffer)
-    .rotate()
-    .jpeg({ quality: 96 })
-    .toBuffer();
+async function recognizeOneSafe(worker, buffer, pageSegMode) {
+  if (!buffer || !buffer.length) return '';
 
-  const metadata = await sharp(orientedBuffer).metadata();
-  const width = Math.max(1, metadata.width || 1200);
-  const height = Math.max(1, metadata.height || 1600);
+  try {
+    const meta = await sharp(buffer).metadata();
 
-  const upscaleWidth = Math.min(Math.max(Math.round(width * 2.5), 1800), 3000);
-  const base = (input) => input
+    // Never pass suspicious tiny images into Tesseract.
+    if ((meta.width || 0) < 40 || (meta.height || 0) < 40) {
+      console.warn(`OCR image skipped: too small (${meta.width || 0}x${meta.height || 0})`);
+      return '';
+    }
+
+    await worker.setParameters({
+      tessedit_pageseg_mode: String(pageSegMode),
+      preserve_interword_spaces: '1'
+    });
+
+    const result = await worker.recognize(buffer);
+    return result?.data?.text || '';
+  } catch (error) {
+    console.warn('OCR variant skipped:', error.message);
+    return '';
+  }
+}
+
+async function makeSafeOcrImage(imageBuffer, options = {}) {
+  const sourceMeta = await sharp(imageBuffer).rotate().metadata();
+  const originalWidth = Math.max(1, sourceMeta.width || 1200);
+  const originalHeight = Math.max(1, sourceMeta.height || 1600);
+
+  let pipeline = sharp(imageBuffer).rotate();
+
+  if (options.crop) {
+    const { topRatio, heightRatio } = options.crop;
+    const top = Math.max(0, Math.min(originalHeight - 1, Math.floor(originalHeight * topRatio)));
+    const cropHeight = Math.max(
+      40,
+      Math.min(originalHeight - top, Math.floor(originalHeight * heightRatio))
+    );
+
+    if (originalWidth < 40 || cropHeight < 40) return null;
+
+    pipeline = pipeline.extract({
+      left: 0,
+      top,
+      width: originalWidth,
+      height: cropHeight
+    });
+  }
+
+  // 1900px is enough for thermal text while keeping decoded image memory well below
+  // the previous 3000px multi-buffer implementation.
+  const targetWidth = Math.min(
+    Math.max(Math.round(originalWidth * 1.65), 1300),
+    1900
+  );
+
+  pipeline = pipeline
     .grayscale()
     .normalize()
-    .sharpen({ sigma: 1.4 })
-    .resize({ width: upscaleWidth, withoutEnlargement: false });
+    .resize({ width: targetWidth, withoutEnlargement: false })
+    .sharpen({ sigma: 1.05 });
 
-  // Safe crop helper: never allow Sharp/Tesseract to receive a zero/tiny invalid crop.
-  function safeCrop(topRatio, heightRatio) {
-    const top = Math.max(0, Math.min(height - 1, Math.floor(height * topRatio)));
-    const requestedHeight = Math.max(1, Math.floor(height * heightRatio));
-    const cropHeight = Math.max(1, Math.min(height - top, requestedHeight));
-
-    // If a calculated crop is suspiciously small, use the complete oriented receipt instead.
-    if (width < 80 || cropHeight < 80) return sharp(orientedBuffer);
-    return sharp(orientedBuffer).extract({ left: 0, top, width, height: cropHeight });
+  if (options.mode === 'contrast') {
+    pipeline = pipeline.linear(1.42, -24);
+  } else if (options.mode === 'threshold') {
+    pipeline = pipeline.threshold(options.threshold || 188);
   }
 
-  // Top area: Branch / Shift Summary header.
-  const topSource = () => safeCrop(0, 0.28);
-  const topNormal = await base(topSource()).png().toBuffer();
-  const topHighContrast = await base(topSource()).linear(1.55, -35).png().toBuffer();
-  const topThreshold = await base(topSource()).threshold(178).png().toBuffer();
-  const topThresholdLight = await base(topSource()).threshold(205).png().toBuffer();
+  return pipeline.jpeg({ quality: 88, mozjpeg: true }).toBuffer();
+}
 
-  // Cash Drawer position varies by receipt length. Use overlapping, generous crops.
+async function recognizeRecipeSequential(worker, imageBuffer) {
+  const branchTexts = [];
+  const drawerTexts = [];
+  const fullTexts = [];
+
+  // IMPORTANT: create -> OCR -> release ONE image at a time.
+  // No array of large processed image buffers is kept in memory.
+
+  // Branch: 3 lightweight variants.
+  for (const mode of ['normal', 'contrast', 'threshold']) {
+    let buffer = await makeSafeOcrImage(imageBuffer, {
+      crop: { topRatio: 0.00, heightRatio: 0.24 },
+      mode,
+      threshold: 188
+    });
+    if (buffer) branchTexts.push(await recognizeOneSafe(worker, buffer, 6));
+    buffer = null;
+  }
+
+  // Cash Drawer: overlapping positions remain, but only 2 variants per crop.
   const drawerCrops = [
-    [0.34, 0.56],
-    [0.42, 0.52],
-    [0.50, 0.46],
-    [0.56, 0.40]
+    [0.42, 0.46],
+    [0.50, 0.42],
+    [0.58, 0.34]
   ];
-  const drawerVariants = [];
+
   for (const [topRatio, heightRatio] of drawerCrops) {
-    const crop = () => safeCrop(topRatio, heightRatio);
-    drawerVariants.push(await base(crop()).png().toBuffer());
-    drawerVariants.push(await base(crop()).linear(1.5, -30).png().toBuffer());
-    drawerVariants.push(await base(crop()).threshold(185).png().toBuffer());
+    for (const mode of ['normal', 'threshold']) {
+      let buffer = await makeSafeOcrImage(imageBuffer, {
+        crop: { topRatio, heightRatio },
+        mode,
+        threshold: 188
+      });
+      if (buffer) drawerTexts.push(await recognizeOneSafe(worker, buffer, 6));
+      buffer = null;
+    }
   }
 
-  // Full-image fallbacks are always generated from the already-oriented image.
-  const full = await base(sharp(orientedBuffer)).png().toBuffer();
-  const fullHighContrast = await base(sharp(orientedBuffer)).linear(1.45, -25).png().toBuffer();
-  const fullThreshold = await base(sharp(orientedBuffer)).threshold(188).png().toBuffer();
-  const fullThresholdLight = await base(sharp(orientedBuffer)).threshold(205).png().toBuffer();
+  // Full receipt: only 3 processed buffers, sequentially.
+  // Normal image gets both PSM 3 and PSM 6 because it is the most useful fallback.
+  for (const mode of ['normal', 'contrast', 'threshold']) {
+    let buffer = await makeSafeOcrImage(imageBuffer, {
+      mode,
+      threshold: 192
+    });
+
+    if (buffer) {
+      fullTexts.push(await recognizeOneSafe(worker, buffer, 3));
+      if (mode === 'normal') {
+        fullTexts.push(await recognizeOneSafe(worker, buffer, 6));
+      }
+    }
+    buffer = null;
+  }
 
   return {
-    branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
-    drawer: drawerVariants,
-    full: [full, fullHighContrast, fullThreshold, fullThresholdLight]
+    branchTexts: branchTexts.filter(Boolean),
+    drawerTexts: drawerTexts.filter(Boolean),
+    fullTexts: fullTexts.filter(Boolean)
   };
 }
 
-async function recognizeVariants(worker, variants, pageSegMode) {
-  await worker.setParameters({
-    tessedit_pageseg_mode: String(pageSegMode),
-    preserve_interword_spaces: '1'
-  });
-
-  const texts = [];
-  for (const variant of variants) {
-    const result = await worker.recognize(variant);
-    texts.push(result?.data?.text || '');
-  }
-  return texts;
-}
 
 async function recognizeReceipt(imageBuffer) {
   return runOcrExclusive(async () => {
     const worker = await getSharedWorker();
-    const variants = await buildOcrVariants(imageBuffer);
 
-    // PSM 6 works much better for the small, single receipt block at the top/drawer.
-    const branchTexts = await recognizeVariants(worker, variants.branch, 6);
-    const drawerTexts = await recognizeVariants(worker, variants.drawer, 6);
-    // PSM 3 is kept as a general fallback for the whole receipt.
-    const fullTextsPsm3 = await recognizeVariants(worker, variants.full, 3);
-    const fullTextsPsm6 = await recognizeVariants(worker, variants.full, 6);
-    const fullTexts = [...fullTextsPsm3, ...fullTextsPsm6];
+    console.log('Shift OCR memory-safe sequential pass started');
+    const {
+      branchTexts,
+      drawerTexts,
+      fullTexts
+    } = await recognizeRecipeSequential(worker, imageBuffer);
+    console.log(
+      `Shift OCR done: branch=${branchTexts.length}, drawer=${drawerTexts.length}, full=${fullTexts.length}`
+    );
 
     const branchText = branchTexts.join('\n');
     const drawerText = drawerTexts.join('\n');
@@ -686,6 +742,7 @@ async function recognizeReceipt(imageBuffer) {
       balance,
       difference: resolvedDifference,
       amountSource: chosen.source,
+      ocrMode: 'phase16_memory_safe_sequential',
       drawerValues,
       payInOutText: fullTexts[0] || fullText || combinedText,
       text: combinedText
