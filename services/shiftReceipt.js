@@ -576,91 +576,6 @@ async function buildOcrVariants(imageBuffer) {
   };
 }
 
-async function buildLightRecoveryVariants(imageBuffer) {
-  const meta = await sharp(imageBuffer).rotate().metadata();
-  const width = meta.width || 1200;
-  const height = meta.height || 1600;
-  const outWidth = Math.min(Math.max(width * 2, 1400), 2000);
-
-  const safeCrop = async (topRatio, heightRatio) => {
-    const top = Math.max(0, Math.floor(height * topRatio));
-    const cropHeight = Math.max(40, Math.min(height - top, Math.floor(height * heightRatio)));
-    if (width < 40 || cropHeight < 40) return null;
-    return sharp(imageBuffer)
-      .rotate()
-      .extract({ left: 0, top, width, height: cropHeight })
-      .grayscale()
-      .normalize()
-      .resize({ width: outWidth, withoutEnlargement: false })
-      .sharpen()
-      .png()
-      .toBuffer();
-  };
-
-  const branch = await safeCrop(0.00, 0.30);
-  const cash1 = await safeCrop(0.48, 0.34);
-  const cash2 = await safeCrop(0.62, 0.32);
-
-  return {
-    branch: branch ? [branch] : [],
-    cash: [cash1, cash2].filter(Boolean)
-  };
-}
-
-async function lightRecoverMissingFields(worker, imageBuffer, branch, actualEndingCash) {
-  const variants = await buildLightRecoveryVariants(imageBuffer);
-  let recoveredBranch = branch || null;
-  let recoveredBranchRaw = null;
-  let recoveredCash = Number.isFinite(Number(actualEndingCash))
-    ? Number(actualEndingCash)
-    : null;
-  let text = "";
-
-  // One extra branch pass only.
-  if (!recoveredBranch && variants.branch.length) {
-    const texts = await recognizeVariants(worker, variants.branch, 6);
-    text += texts.join("\n");
-    for (const t of texts) {
-      const info = extractBranch(
-        String(t || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean)
-      );
-      if (info.branch) {
-        recoveredBranch = info.branch;
-        recoveredBranchRaw = info.branchRaw || info.branch;
-        break;
-      }
-    }
-  }
-
-  // Two cash crops, one OCR mode. Accept only labelled Actual Ending Cash.
-  if (recoveredCash === null && variants.cash.length) {
-    const texts = await recognizeVariants(worker, variants.cash, 6);
-    text += "\n" + texts.join("\n");
-    const values = texts
-      .map(extractActualEndingCashFromText)
-      .filter(v => v !== null && Number.isFinite(Number(v)));
-
-    if (values.length) {
-      // If both crops produce values, require agreement. If only one crop
-      // contains the labelled line, accept that labelled result.
-      if (values.length === 1) {
-        recoveredCash = Number(values[0]);
-      } else {
-        const a = Number(values[0]).toFixed(2);
-        const same = values.every(v => Number(v).toFixed(2) === a);
-        if (same) recoveredCash = Number(values[0]);
-      }
-    }
-  }
-
-  return {
-    branch: recoveredBranch,
-    branchRaw: recoveredBranchRaw,
-    actualEndingCash: recoveredCash,
-    text
-  };
-}
-
 async function recognizeVariants(worker, variants, pageSegMode) {
   await worker.setParameters({
     tessedit_pageseg_mode: String(pageSegMode),
@@ -673,6 +588,76 @@ async function recognizeVariants(worker, variants, pageSegMode) {
     texts.push(result?.data?.text || '');
   }
   return texts;
+}
+
+async function oneLightRetry(worker, imageBuffer, missingBranch, missingCash) {
+  const meta = await sharp(imageBuffer).rotate().metadata();
+  const width = meta.width || 1200;
+  const height = meta.height || 1600;
+
+  // Keep this retry intentionally small so Render does not get overloaded.
+  const targetWidth = Math.min(Math.max(Math.round(width * 1.6), 1400), 1900);
+
+  async function safeCrop(topRatio, heightRatio) {
+    const top = Math.max(0, Math.floor(height * topRatio));
+    const cropHeight = Math.min(height - top, Math.max(120, Math.floor(height * heightRatio)));
+    if (width < 120 || cropHeight < 120) return null;
+
+    return sharp(imageBuffer)
+      .rotate()
+      .extract({ left: 0, top, width, height: cropHeight })
+      .grayscale()
+      .normalize()
+      .resize({ width: targetWidth, withoutEnlargement: false })
+      .sharpen({ sigma: 1.0 })
+      .linear(1.25, -10)
+      .png()
+      .toBuffer();
+  }
+
+  let branch = null;
+  let branchRaw = null;
+  let actualEndingCash = null;
+  let debugText = '';
+
+  // ONE extra branch attempt only.
+  if (missingBranch) {
+    const branchImage = await safeCrop(0.00, 0.30);
+    if (branchImage) {
+      const texts = await recognizeVariants(worker, [branchImage], 6);
+      debugText += texts.join('\n');
+      const lines = texts.join('\n').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      const info = extractBranch(lines);
+      if (info.branch) {
+        branch = info.branch;
+        branchRaw = info.branchRaw || info.branch;
+      }
+    }
+  }
+
+  // ONE extra cash attempt only.
+  // Use a broad middle/lower crop and ONLY labelled Actual Ending Cash parsing.
+  if (missingCash) {
+    const cashImage = await safeCrop(0.42, 0.44);
+    if (cashImage) {
+      const texts = await recognizeVariants(worker, [cashImage], 6);
+      debugText += '\n' + texts.join('\n');
+      const labelled = texts
+        .map(extractActualEndingCashFromText)
+        .filter(v => v !== null && Number.isFinite(Number(v)));
+
+      if (labelled.length === 1) {
+        actualEndingCash = Number(labelled[0]);
+      } else if (labelled.length > 1) {
+        const first = Number(labelled[0]).toFixed(2);
+        if (labelled.every(v => Number(v).toFixed(2) === first)) {
+          actualEndingCash = Number(labelled[0]);
+        }
+      }
+    }
+  }
+
+  return { branch, branchRaw, actualEndingCash, debugText };
 }
 
 async function recognizeReceipt(imageBuffer) {
@@ -721,32 +706,32 @@ async function recognizeReceipt(imageBuffer) {
       }
     }
 
-    // LIGHT recovery: only when the original Phase16 pass missed Branch or Actual Ending Cash.
-    // Kept deliberately small for Render memory/CPU limits.
+    // ONE LIGHT RETRY only when the original Phase16 pass misses a critical field.
+    // Existing successful receipts keep the original path unchanged.
     if (!branchInfo.branch || chosen.amount === null) {
-      const recovered = await lightRecoverMissingFields(
+      const retry = await oneLightRetry(
         worker,
         imageBuffer,
-        branchInfo.branch,
-        chosen.amount
+        !branchInfo.branch,
+        chosen.amount === null
       );
 
-      if (!branchInfo.branch && recovered.branch) {
+      if (!branchInfo.branch && retry.branch) {
         branchInfo = {
-          branch: recovered.branch,
-          branchRaw: recovered.branchRaw || recovered.branch
+          branch: retry.branch,
+          branchRaw: retry.branchRaw || retry.branch
         };
       }
 
-      if (chosen.amount === null && recovered.actualEndingCash !== null) {
+      if (chosen.amount === null && retry.actualEndingCash !== null) {
         chosen = {
-          amount: recovered.actualEndingCash,
-          source: 'light_recovery_label'
+          amount: retry.actualEndingCash,
+          source: 'one_light_retry'
         };
-        drawerValues.actualEndingCash = recovered.actualEndingCash;
+        drawerValues.actualEndingCash = retry.actualEndingCash;
       }
 
-      if (recovered.text) combinedText += '\n' + recovered.text;
+      if (retry.debugText) combinedText += '\n' + retry.debugText;
     }
 
     if (!branchInfo.branch) {
