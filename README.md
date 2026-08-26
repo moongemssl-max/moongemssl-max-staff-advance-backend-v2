@@ -84,33 +84,3 @@ When an employee sends an image to the same WhatsApp Business number, the webhoo
 Existing text-based advance-request handling remains unchanged.
 
 OCR packages are installed by the normal Render build command (`npm install`). The first OCR run after a fresh deploy can be slower because the English OCR model may need to be loaded.
-
-## Shift Summary Phase 17 - No Repeat Photo / Sequential Manual Recovery
-
-The Shift Summary flow now uses the employee's WhatsApp number to select the branch, so branch OCR is no longer required.
-
-Configure employee numbers in Render:
-
-- `SHIFT_MAIN_EMPLOYEE_NUMBERS` - comma-separated WhatsApp numbers of the two MAIN employees.
-- `SHIFT_GETAHETTA_EMPLOYEE_NUMBERS` - comma-separated WhatsApp numbers of the GETAHETTA employee(s).
-- `SHIFT_ADMIN_WHATSAPP_NUMBER` - owner's personal WhatsApp number used only as a last-resort OCR fallback.
-
-The OCR flow is now:
-
-1. Read Actual Ending Cash, Difference and Pay In/Out rows.
-2. If Actual Ending Cash is unclear, ask only for Actual Ending Cash.
-3. Once supplied, if Difference is unclear, ask only for Difference.
-4. Finish the shift calculation and reply normally.
-5. If no useful shift value can be recovered at all, forward the original photo to the owner's WhatsApp instead of asking the employee to resend it.
-
-SHIFT_MAIN_EMPLOYEE_NUMBERS=94789076646
-SHIFT_GETAHETTA_EMPLOYEE_NUMBERS=94776430580,94762039647
-SHIFT_ADMIN_WHATSAPP_NUMBER=94715736399
-
-## Shift WhatsApp branch mapping
-
-```env
-SHIFT_MAIN_EMPLOYEE_NUMBERS=94789076646
-SHIFT_GETAHETTA_EMPLOYEE_NUMBERS=94776430580,94762039647
-SHIFT_ADMIN_WHATSAPP_NUMBER=94715736399
-```
