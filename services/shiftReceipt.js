@@ -123,52 +123,102 @@ function detectKnownBranch(value) {
   const text = String(value || '');
   const compact = compactLetters(text);
 
-  // Known printed names / common OCR variations for the two shops.
-  const getahettaAliases = [
-    'getahetta', 'getahetta', 'getahatta', 'gettahetta', 'getaheta',
-    'getaherta', 'getaherta', 'getahetra', 'getahetta'
+  // MAIN: accept common thermal-OCR variants such as:
+  // Main Branch / Main B/anch / Main Braneh / Main Brancn / MainBranch.
+  const mainSignals = [
+    'mainbranch',
+    'mainbranc',
+    'mainbraneh',
+    'mainbrancn',
+    'mainbrnch',
+    'mainbran',
+    'main'
   ];
-  if (getahettaAliases.some((alias) => compact.includes(alias)) || fuzzyContains(text, 'getahetta', 3)) {
-    return 'GETAHETTA';
+
+  if (
+    mainSignals.some((signal) => compact.includes(signal)) ||
+    fuzzyContains(text, 'main branch', 3) ||
+    fuzzyContains(text, 'main', 1)
+  ) {
+    return 'MAIN';
   }
 
-  // "Main Branch" is short and OCR normally reads at least one of these words.
-  if (compact.includes('mainbranch') || compact.includes('main') || fuzzyContains(text, 'main', 1)) {
-    return 'MAIN';
+  // GETAHETTA: keep known OCR variations.
+  const getahettaSignals = [
+    'getahetta',
+    'getahatta',
+    'gettahetta',
+    'getaheta',
+    'getaherta',
+    'getahetra',
+    'getahett'
+  ];
+
+  if (
+    getahettaSignals.some((signal) => compact.includes(signal)) ||
+    fuzzyContains(text, 'getahetta', 3)
+  ) {
+    return 'GETAHETTA';
   }
 
   return null;
 }
 
 function extractBranch(lines) {
-  // 1) Prefer a line explicitly labelled Branch, allowing OCR errors such as "Braneh" / "Brancn".
-  for (const rawLine of lines) {
-    const line = normalizeLine(rawLine);
-    const compact = compactLetters(line);
-    const hasBranchLabel = compact.includes('branch') || fuzzyContains(line, 'branch', 2);
+  const normalizedLines = (lines || [])
+    .map((line) => String(line || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  // 1) Strongest rule: if a line contains a Branch-like label,
+  // read the text AFTER the label first.
+  for (const rawLine of normalizedLines) {
+    const cleaned = rawLine
+      .replace(/[|]/g, 'I')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const compact = compactLetters(cleaned);
+    const hasBranchLabel =
+      compact.includes('branch') ||
+      fuzzyContains(cleaned, 'branch', 3) ||
+      /br[a-z0-9\/\\]{2,8}\s*[:\-]/i.test(cleaned);
+
     if (!hasBranchLabel) continue;
 
-    const known = detectKnownBranch(line);
-    if (known) return { branch: known, branchRaw: line };
+    // Typical: "Branch: Main Branch"
+    // OCR variants: "Braneh: Main B/anch", "Branch Main Brancn"
+    const afterLabel = cleaned
+      .replace(/^.*?br[a-z0-9\/\\]{2,8}\s*[:\-]?\s*/i, '')
+      .trim();
 
-    const match = line.match(/br[a-z0-9]{2,8}\s*[:\-]?\s*(.+)$/i);
-    if (match?.[1]) {
-      const branchRaw = match[1].trim();
-      const mapped = detectKnownBranch(branchRaw);
-      if (mapped) return { branch: mapped, branchRaw };
+    if (afterLabel) {
+      const mappedAfter = detectKnownBranch(afterLabel);
+      if (mappedAfter) {
+        return { branch: mappedAfter, branchRaw: afterLabel };
+      }
+    }
+
+    // If extraction after the label was imperfect, inspect the entire line.
+    const mappedWhole = detectKnownBranch(cleaned);
+    if (mappedWhole) {
+      return { branch: mappedWhole, branchRaw: cleaned };
     }
   }
 
-  // 2) The top crop contains little else, so accept a known branch name even when "Branch:" was lost.
-  for (const rawLine of lines.slice(0, Math.min(lines.length, 24))) {
-    const known = detectKnownBranch(rawLine);
-    if (known) return { branch: known, branchRaw: normalizeLine(rawLine) };
+  // 2) Header crop fallback: known branch name may survive even if "Branch:" is lost.
+  for (const rawLine of normalizedLines.slice(0, 30)) {
+    const mapped = detectKnownBranch(rawLine);
+    if (mapped) {
+      return { branch: mapped, branchRaw: rawLine };
+    }
   }
 
-  // 3) Last fallback: search all OCR text for the long/unique Getahetta name. For MAIN we remain
-  // conservative to avoid matching unrelated words elsewhere on the receipt.
-  const whole = lines.join(' ');
-  if (fuzzyContains(whole, 'getahetta', 3)) return { branch: 'GETAHETTA', branchRaw: 'Getahetta' };
+  // 3) Joined header fallback for OCR that split "Main" and "Branch" over separate lines.
+  const headerText = normalizedLines.slice(0, 30).join(' ');
+  const mappedHeader = detectKnownBranch(headerText);
+  if (mappedHeader) {
+    return { branch: mappedHeader, branchRaw: headerText };
+  }
 
   return { branch: null, branchRaw: null };
 }
