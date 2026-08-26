@@ -526,48 +526,63 @@ async function downloadWhatsAppImage(mediaId) {
 }
 
 async function buildOcrVariants(imageBuffer) {
-  const metadata = await sharp(imageBuffer).rotate().metadata();
-  const width = metadata.width || 1200;
-  const height = metadata.height || 1600;
+  // IMPORTANT: apply EXIF rotation ONCE before reading width/height or calculating crops.
+  // Previously metadata could describe the unrotated phone photo while extract() ran after
+  // rotate(), which occasionally produced tiny strips such as 2x36 pixels.
+  const orientedBuffer = await sharp(imageBuffer)
+    .rotate()
+    .jpeg({ quality: 96 })
+    .toBuffer();
+
+  const metadata = await sharp(orientedBuffer).metadata();
+  const width = Math.max(1, metadata.width || 1200);
+  const height = Math.max(1, metadata.height || 1600);
 
   const upscaleWidth = Math.min(Math.max(Math.round(width * 2.5), 1800), 3000);
   const base = (input) => input
-    .rotate()
     .grayscale()
     .normalize()
     .sharpen({ sigma: 1.4 })
     .resize({ width: upscaleWidth, withoutEnlargement: false });
 
-  // Top 22% is where "Branch:" is printed on these Shift Summary receipts.
-  const topHeight = Math.max(1, Math.floor(height * 0.22));
-  const topSource = () => sharp(imageBuffer).rotate().extract({ left: 0, top: 0, width, height: topHeight });
+  // Safe crop helper: never allow Sharp/Tesseract to receive a zero/tiny invalid crop.
+  function safeCrop(topRatio, heightRatio) {
+    const top = Math.max(0, Math.min(height - 1, Math.floor(height * topRatio)));
+    const requestedHeight = Math.max(1, Math.floor(height * heightRatio));
+    const cropHeight = Math.max(1, Math.min(height - top, requestedHeight));
 
+    // If a calculated crop is suspiciously small, use the complete oriented receipt instead.
+    if (width < 80 || cropHeight < 80) return sharp(orientedBuffer);
+    return sharp(orientedBuffer).extract({ left: 0, top, width, height: cropHeight });
+  }
+
+  // Top area: Branch / Shift Summary header.
+  const topSource = () => safeCrop(0, 0.28);
   const topNormal = await base(topSource()).png().toBuffer();
   const topHighContrast = await base(topSource()).linear(1.55, -35).png().toBuffer();
   const topThreshold = await base(topSource()).threshold(178).png().toBuffer();
   const topThresholdLight = await base(topSource()).threshold(205).png().toBuffer();
 
-  // Cash Drawer position varies with receipt length (refund/credit sections add height),
-  // so OCR several overlapping middle/lower crops instead of relying on one fixed crop.
+  // Cash Drawer position varies by receipt length. Use overlapping, generous crops.
   const drawerCrops = [
-    [0.42, 0.46],
-    [0.50, 0.42],
-    [0.58, 0.34]
+    [0.34, 0.56],
+    [0.42, 0.52],
+    [0.50, 0.46],
+    [0.56, 0.40]
   ];
   const drawerVariants = [];
   for (const [topRatio, heightRatio] of drawerCrops) {
-    const cropTop = Math.max(0, Math.floor(height * topRatio));
-    const cropHeight = Math.max(1, Math.min(height - cropTop, Math.floor(height * heightRatio)));
-    const crop = () => sharp(imageBuffer).rotate().extract({ left: 0, top: cropTop, width, height: cropHeight });
+    const crop = () => safeCrop(topRatio, heightRatio);
     drawerVariants.push(await base(crop()).png().toBuffer());
     drawerVariants.push(await base(crop()).linear(1.5, -30).png().toBuffer());
     drawerVariants.push(await base(crop()).threshold(185).png().toBuffer());
   }
 
-  const full = await base(sharp(imageBuffer)).png().toBuffer();
-  const fullHighContrast = await base(sharp(imageBuffer)).linear(1.45, -25).png().toBuffer();
-  const fullThreshold = await base(sharp(imageBuffer)).threshold(188).png().toBuffer();
-  const fullThresholdLight = await base(sharp(imageBuffer)).threshold(205).png().toBuffer();
+  // Full-image fallbacks are always generated from the already-oriented image.
+  const full = await base(sharp(orientedBuffer)).png().toBuffer();
+  const fullHighContrast = await base(sharp(orientedBuffer)).linear(1.45, -25).png().toBuffer();
+  const fullThreshold = await base(sharp(orientedBuffer)).threshold(188).png().toBuffer();
+  const fullThresholdLight = await base(sharp(orientedBuffer)).threshold(205).png().toBuffer();
 
   return {
     branch: [topNormal, topHighContrast, topThreshold, topThresholdLight],
@@ -588,76 +603,6 @@ async function recognizeVariants(worker, variants, pageSegMode) {
     texts.push(result?.data?.text || '');
   }
   return texts;
-}
-
-async function oneLightRetry(worker, imageBuffer, missingBranch, missingCash) {
-  const meta = await sharp(imageBuffer).rotate().metadata();
-  const width = meta.width || 1200;
-  const height = meta.height || 1600;
-
-  // Keep this retry intentionally small so Render does not get overloaded.
-  const targetWidth = Math.min(Math.max(Math.round(width * 1.6), 1400), 1900);
-
-  async function safeCrop(topRatio, heightRatio) {
-    const top = Math.max(0, Math.floor(height * topRatio));
-    const cropHeight = Math.min(height - top, Math.max(120, Math.floor(height * heightRatio)));
-    if (width < 120 || cropHeight < 120) return null;
-
-    return sharp(imageBuffer)
-      .rotate()
-      .extract({ left: 0, top, width, height: cropHeight })
-      .grayscale()
-      .normalize()
-      .resize({ width: targetWidth, withoutEnlargement: false })
-      .sharpen({ sigma: 1.0 })
-      .linear(1.25, -10)
-      .png()
-      .toBuffer();
-  }
-
-  let branch = null;
-  let branchRaw = null;
-  let actualEndingCash = null;
-  let debugText = '';
-
-  // ONE extra branch attempt only.
-  if (missingBranch) {
-    const branchImage = await safeCrop(0.00, 0.30);
-    if (branchImage) {
-      const texts = await recognizeVariants(worker, [branchImage], 6);
-      debugText += texts.join('\n');
-      const lines = texts.join('\n').split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-      const info = extractBranch(lines);
-      if (info.branch) {
-        branch = info.branch;
-        branchRaw = info.branchRaw || info.branch;
-      }
-    }
-  }
-
-  // ONE extra cash attempt only.
-  // Use a broad middle/lower crop and ONLY labelled Actual Ending Cash parsing.
-  if (missingCash) {
-    const cashImage = await safeCrop(0.42, 0.44);
-    if (cashImage) {
-      const texts = await recognizeVariants(worker, [cashImage], 6);
-      debugText += '\n' + texts.join('\n');
-      const labelled = texts
-        .map(extractActualEndingCashFromText)
-        .filter(v => v !== null && Number.isFinite(Number(v)));
-
-      if (labelled.length === 1) {
-        actualEndingCash = Number(labelled[0]);
-      } else if (labelled.length > 1) {
-        const first = Number(labelled[0]).toFixed(2);
-        if (labelled.every(v => Number(v).toFixed(2) === first)) {
-          actualEndingCash = Number(labelled[0]);
-        }
-      }
-    }
-  }
-
-  return { branch, branchRaw, actualEndingCash, debugText };
 }
 
 async function recognizeReceipt(imageBuffer) {
@@ -704,34 +649,6 @@ async function recognizeReceipt(imageBuffer) {
         chosen = { amount: best, source: 'labelled_actual_ending_cash_fallback' };
         drawerValues.actualEndingCash = best;
       }
-    }
-
-    // ONE LIGHT RETRY only when the original Phase16 pass misses a critical field.
-    // Existing successful receipts keep the original path unchanged.
-    if (!branchInfo.branch || chosen.amount === null) {
-      const retry = await oneLightRetry(
-        worker,
-        imageBuffer,
-        !branchInfo.branch,
-        chosen.amount === null
-      );
-
-      if (!branchInfo.branch && retry.branch) {
-        branchInfo = {
-          branch: retry.branch,
-          branchRaw: retry.branchRaw || retry.branch
-        };
-      }
-
-      if (chosen.amount === null && retry.actualEndingCash !== null) {
-        chosen = {
-          amount: retry.actualEndingCash,
-          source: 'one_light_retry'
-        };
-        drawerValues.actualEndingCash = retry.actualEndingCash;
-      }
-
-      if (retry.debugText) combinedText += '\n' + retry.debugText;
     }
 
     if (!branchInfo.branch) {
