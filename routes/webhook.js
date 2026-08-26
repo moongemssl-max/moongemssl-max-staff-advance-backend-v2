@@ -7,22 +7,18 @@ const { sendAdvanceRequestNotification } = require('../services/notifications');
 const sendWhatsAppMessage = require('../services/whatsapp');
 const {
   downloadWhatsAppImage,
-  recognizeReceipt,
-  buildReply,
+  recognizeFullReceipt,
+  recognizeField,
   calculateBalance,
   calculateBringAmount,
-  extractPayInOutItems,
-  recognizeReceiptSection,
-  inspectPayInOutSection,
-  recognizeReceiptField,
-  extractPayTotalsAndCount,
-  mergeUniquePayItems,
-  payItemsComplete,
-  reconcilePayItemsWithTotals
+  buildReply,
+  paySectionComplete
 } = require('../services/shiftReceipt');
 
 const router = express.Router();
 
+const FLOW_VERSION = 'clean_rebuild_v1';
+const SESSION_TTL_MS = 45 * 60 * 1000;
 
 const DEFAULT_PAY_IN_OUT_REASONS = [
   'Hadunkuru',
@@ -40,8 +36,14 @@ const DEFAULT_PAY_IN_OUT_REASONS = [
 async function getPayInOutReasons() {
   try {
     const doc = await db.collection('app_settings').doc('pay_in_out_reasons').get();
-    const values = doc.exists && Array.isArray(doc.data()?.reasons) ? doc.data().reasons : [];
-    const cleaned = values.map((value) => String(value || '').trim()).filter(Boolean);
+    const values = doc.exists && Array.isArray(doc.data()?.reasons)
+      ? doc.data().reasons
+      : [];
+
+    const cleaned = values
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+
     return cleaned.length ? cleaned : DEFAULT_PAY_IN_OUT_REASONS;
   } catch (error) {
     console.warn('Could not load Pay In/Out reasons, using defaults:', error.message);
@@ -62,88 +64,24 @@ router.get('/', (req, res) => {
   return res.sendStatus(403);
 });
 
-const SESSION_TTL_MS = 45 * 60 * 1000;
-const FLOW_VERSION = 'cash_first_field_recovery_v1';
-
-function sessionDocId(senderNumber) {
+function sessionId(senderNumber) {
   return String(senderNumber || '').replace(/\D/g, '').slice(-15) || 'unknown';
 }
 
-function criticalMissingField(data) {
-  if (!data?.branch) return 'branch';
-  if (!Number.isFinite(Number(data?.actualEndingCash))) return 'actual_ending_cash';
-  return null;
-}
-
-function reportMissingField(data) {
-  if (!Number.isFinite(Number(data?.difference))) return 'difference';
-
-  const totals = data?.payTotals || null;
-  const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
-
-  if (
-    !totals ||
-    (totals.count == null && totals.totalPayIn == null && totals.totalPayOut == null)
-  ) {
-    return 'pay_totals';
-  }
-
-  // Printed Count is authoritative because extractPayInOutItems() only returns
-  // rows that begin with IN/OUT.
-  if (
-    totals.count != null &&
-    Number.isFinite(Number(totals.count)) &&
-    items.length === Number(totals.count)
-  ) {
-    return null;
-  }
-
-  const reconciled = reconcilePayItemsWithTotals(items, totals);
-  if (!reconciled.complete) return 'pay_line';
-  return null;
-}
-
-function nextMissingField(data) {
-  return criticalMissingField(data) || reportMissingField(data);
-}
-
-function fieldPrompt(field, data = {}) {
-  switch (field) {
-    case 'branch':
-      return 'Branch එක විතරක් read වුණේ නැහැ. Receipt එකේ Branch / Shift Summary header තියෙන පොඩි කොටස විතරක් ලඟින් photo එකක් එවන්න.';
-    case 'actual_ending_cash':
-      return 'Actual Ending Cash value එක විතරක් read වුණේ නැහැ. “Actual Ending Cash” line එක පේන පොඩි කොටස විතරක් ලඟින් photo එකක් එවන්න.';
-    case 'difference':
-      return 'Cash instruction එක දීලා ඉවරයි. Report එකට Difference value එක විතරක් තව ඕන. “Difference” line එක පේන පොඩි කොටස විතරක් photo එකක් එවන්න.';
-    case 'pay_totals':
-      return 'Cash instruction එක දීලා ඉවරයි. Report එකට Pay In/Out totals ටික තව ඕන. “Payin/Payout Count, Total Payin, Total Payout” lines පේන පොඩි කොටස විතරක් photo එකක් එවන්න.';
-    case 'pay_line': {
-      const totals = data?.payTotals || {};
-      const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
-      const expected = totals.count != null ? Number(totals.count) : null;
-      const got = items.length;
-      const suffix = expected != null ? ` (${got}/${expected} lines read)` : '';
-      return `Cash instruction එක දීලා ඉවරයි. Report එකට Pay In/Out transaction line එකක් තව ඕන${suffix}. Reason + Amount + (IN/OUT) පේන ඒ line එක විතරක් ලඟින් photo එකක් එවන්න.`;
-    }
-    default:
-      return 'Read නොවුණු පොඩි කොටස විතරක් ලඟින් photo එකක් එවන්න.';
-  }
-}
-
-async function loadActiveShiftSession(senderNumber) {
-  const ref = db.collection('shift_receipt_sessions').doc(sessionDocId(senderNumber));
+async function loadSession(senderNumber) {
+  const ref = db.collection('shift_receipt_sessions').doc(sessionId(senderNumber));
   const snap = await ref.get();
+
   if (!snap.exists) return { ref, data: null };
 
   const data = snap.data() || {};
   const updatedAt = data.updatedAt?.toDate?.() || data.createdAt?.toDate?.() || null;
 
-  // Drop old/stuck sessions automatically after this deploy.
-  if (
-    data.flowVersion !== FLOW_VERSION ||
-    data.status === 'completed' ||
-    (updatedAt && Date.now() - updatedAt.getTime() > SESSION_TTL_MS)
-  ) {
+  const expired = updatedAt && Date.now() - updatedAt.getTime() > SESSION_TTL_MS;
+  const oldFlow = data.flowVersion !== FLOW_VERSION;
+  const completed = data.status === 'completed';
+
+  if (expired || oldFlow || completed) {
     await ref.delete().catch(() => undefined);
     return { ref, data: null };
   }
@@ -161,121 +99,188 @@ function sriLankaDateKey(date = new Date()) {
     if (part.type !== 'literal') acc[part.type] = part.value;
     return acc;
   }, {});
+
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
-async function ensureCashInstruction(data, currentMessageId, senderNumber) {
-  if (data?.cashInstructionSent === true) {
-    return {
-      cashInstructionSent: true,
-      cashReplyText: data.cashReplyText || null,
-      removeAmount: data.removeAmount,
-      bringAmount: data.bringAmount
-    };
-  }
-
-  const critical = criticalMissingField(data);
-  if (critical) return { cashInstructionSent: false };
-
-  const actualEndingCash = Number(data.actualEndingCash);
-  const removeAmount = calculateBalance(actualEndingCash);
-
-  if (!(removeAmount >= 4000 && removeAmount < 5000)) {
-    throw new Error(`Shift cash safety check failed: ${removeAmount}`);
-  }
-
-  const bringAmount = calculateBringAmount(actualEndingCash, removeAmount);
-  const cashReplyText = buildReply({
-    branch: data.branch,
-    actualEndingCash,
-    balance: removeAmount
-  });
-
-  const sendResult = await sendWhatsAppMessage(senderNumber, cashReplyText);
-  const now = new Date();
-  const rootMessageId = data.rootMessageId || currentMessageId;
-
-  const cashRecord = {
-    id: rootMessageId,
-    whatsappMessageId: rootMessageId,
-    senderNumber,
-    branch: data.branch,
-    branchRaw: data.branchRaw || null,
-    actualEndingCash,
-    removeAmount,
-    balance: removeAmount,
-    bringAmount,
-    difference: Number.isFinite(Number(data.difference)) ? Number(data.difference) : null,
-    drawerValues: data.drawerValues || null,
-    payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems : [],
-    payInOutTotals: data.payTotals || null,
-    cashReplyText,
-    replyText: cashReplyText,
-    replySent: Boolean(sendResult?.success),
-    replyMessageId: sendResult?.messageId || null,
-    cashInstructionSent: Boolean(sendResult?.success),
-    cashInstructionSentAt: now,
-    status: 'cash_instruction_sent',
-    ocrMode: 'cash_first_field_recovery',
-    dateKey: sriLankaDateKey(now),
-    createdAt: now,
-    updatedAt: now
-  };
-
-  // Owner/Android can see the shift immediately, even if report fields still need recovery.
-  await db.collection('shift_cash_history').doc(rootMessageId).set(cashRecord, { merge: true });
-  await db.collection('shift_receipt_messages').doc(rootMessageId).set(cashRecord, { merge: true });
-
-  return {
-    cashInstructionSent: Boolean(sendResult?.success),
-    cashReplyText,
-    removeAmount,
-    bringAmount,
-    cashInstructionSentAt: now
-  };
+function criticalMissing(data) {
+  if (!data?.branch) return 'branch';
+  if (!Number.isFinite(Number(data?.actualEndingCash))) return 'cash';
+  return null;
 }
 
-async function finalizeShiftRecord(data, currentMessageId, senderNumber) {
-  const rootMessageId = data.rootMessageId || currentMessageId;
+function reportMissing(data) {
+  const items = Array.isArray(data?.payInOutItems) ? data.payInOutItems : [];
+  const totals = data?.payTotals || null;
+
+  if (!totals) return 'pay';
+
+  if (paySectionComplete(items, totals)) return null;
+
+  return 'pay';
+}
+
+function promptFor(field, cashAlreadySent = false) {
+  if (field === 'branch') {
+    return 'Branch එක විතරක් read වුණේ නැහැ. Receipt එකේ “Branch:” සහ “Shift Summary” පේන උඩ කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+  }
+
+  if (field === 'cash') {
+    return 'Actual Ending Cash එක විතරක් read වුණේ නැහැ. Receipt එකේ “Cash Drawer” ඇතුළේ “Actual Ending Cash” line එක පේන කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+  }
+
+  if (field === 'pay') {
+    return cashAlreadySent
+      ? 'Cash instruction එක දීලා ඉවරයි. Report එකට Pay In/Out section එක තව ඕන. (IN)/(OUT) lines සහ Payin/Payout Count පේන කොටස විතරක් ලඟින් photo එකක් එවන්න.'
+      : 'Pay In/Out section එක විතරක් තව read කරන්න ඕන. (IN)/(OUT) lines සහ Payin/Payout Count පේන කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+  }
+
+  return 'Read නොවුණු කොටස විතරක් ලඟින් photo එකක් එවන්න.';
+}
+
+async function sendCashInstructionOnce(session, senderNumber) {
+  if (session.cashInstructionSent === true) return session;
+
+  if (criticalMissing(session)) return session;
+
+  const actual = Number(session.actualEndingCash);
+  const balance = calculateBalance(actual);
+
+  if (balance === null) {
+    // Safety: never send a negative/impossible cash instruction.
+    session.actualEndingCash = null;
+    return session;
+  }
+
+  const bringAmount = calculateBringAmount(actual, balance);
+  const replyText = buildReply({
+    branch: session.branch,
+    actualEndingCash: actual,
+    balance
+  });
+
+  const sendResult = await sendWhatsAppMessage(senderNumber, replyText);
+
+  session.balance = balance;
+  session.removeAmount = balance;
+  session.bringAmount = bringAmount;
+  session.cashReplyText = replyText;
+  session.cashInstructionSent = Boolean(sendResult?.success);
+  session.cashReplyMessageId = sendResult?.messageId || null;
+  session.cashInstructionSentAt = new Date();
+
+  return session;
+}
+
+async function saveHistory(session) {
+  const id = session.rootMessageId;
   const now = new Date();
 
-  const record = {
-    id: rootMessageId,
-    whatsappMessageId: rootMessageId,
-    senderNumber,
-    branch: data.branch,
-    branchRaw: data.branchRaw || null,
-    actualEndingCash: Number(data.actualEndingCash),
-    removeAmount: Number(data.removeAmount),
-    balance: Number(data.removeAmount),
-    bringAmount: Number(data.bringAmount),
-    difference: Number.isFinite(Number(data.difference)) ? Number(data.difference) : null,
-    drawerValues: data.drawerValues || null,
-    payInOutItems: Array.isArray(data.payInOutItems) ? data.payInOutItems : [],
-    payInOutTotals: data.payTotals || null,
-    cashReplyText: data.cashReplyText || null,
-    replyText: data.cashReplyText || null,
-    cashInstructionSent: data.cashInstructionSent === true,
-    cashInstructionSentAt: data.cashInstructionSentAt || null,
-    status: 'completed',
-    ocrMode: 'cash_first_field_recovery',
+  await db.collection('shift_cash_history').doc(id).set({
+    id,
+    whatsappMessageId: id,
+    senderNumber: session.senderNumber,
+    branch: session.branch || null,
+    branchRaw: session.branchRaw || null,
+    actualEndingCash: Number.isFinite(Number(session.actualEndingCash))
+      ? Number(session.actualEndingCash)
+      : null,
+    removeAmount: Number.isFinite(Number(session.removeAmount))
+      ? Number(session.removeAmount)
+      : null,
+    balance: Number.isFinite(Number(session.balance))
+      ? Number(session.balance)
+      : null,
+    bringAmount: Number.isFinite(Number(session.bringAmount))
+      ? Number(session.bringAmount)
+      : null,
+    difference: Number.isFinite(Number(session.difference))
+      ? Number(session.difference)
+      : null,
+    drawerValues: session.drawerValues || null,
+    payInOutItems: Array.isArray(session.payInOutItems) ? session.payInOutItems : [],
+    payInOutTotals: session.payTotals || null,
+    payComplete: Boolean(session.payComplete),
+    cashInstructionSent: Boolean(session.cashInstructionSent),
+    cashReplyText: session.cashReplyText || null,
+    ocrMode: FLOW_VERSION,
     dateKey: sriLankaDateKey(now),
-    updatedAt: now
-  };
+    updatedAt: now,
+    createdAt: session.createdAt || now
+  }, { merge: true });
+}
 
-  await db.collection('shift_cash_history').doc(rootMessageId).set(record, { merge: true });
-  await db.collection('shift_receipt_messages').doc(rootMessageId).set(
-    { ...record, processedAt: now },
-    { merge: true }
-  );
+async function continueSessionAfterRead(session, sessionRef, receiptRef, senderNumber) {
+  // Cash reply depends ONLY on Branch + Actual Ending Cash.
+  await sendCashInstructionOnce(session, senderNumber);
 
-  return record;
+  const critical = criticalMissing(session);
+  if (critical) {
+    const reply = promptFor(critical, false);
+    const sendResult = await sendWhatsAppMessage(senderNumber, reply);
+
+    session.awaitingField = critical;
+    session.status = 'waiting_critical';
+    session.lastPrompt = reply;
+    session.updatedAt = new Date();
+
+    await sessionRef.set(session, { merge: true });
+    await receiptRef.set({
+      status: 'waiting_critical',
+      awaitingField: critical,
+      replyText: reply,
+      replySent: Boolean(sendResult?.success),
+      processedAt: new Date()
+    }, { merge: true });
+    return;
+  }
+
+  await saveHistory(session);
+
+  // Pay In/Out is report data only; it never blocks the employee cash instruction.
+  const reportField = reportMissing(session);
+  if (reportField) {
+    const reply = promptFor(reportField, true);
+    const sendResult = await sendWhatsAppMessage(senderNumber, reply);
+
+    session.awaitingField = reportField;
+    session.status = 'cash_sent_waiting_report';
+    session.lastPrompt = reply;
+    session.updatedAt = new Date();
+
+    await sessionRef.set(session, { merge: true });
+    await receiptRef.set({
+      status: 'cash_sent_waiting_report',
+      awaitingField: reportField,
+      cashInstructionSent: session.cashInstructionSent,
+      replyText: reply,
+      replySent: Boolean(sendResult?.success),
+      processedAt: new Date()
+    }, { merge: true });
+    return;
+  }
+
+  session.awaitingField = null;
+  session.status = 'completed';
+  session.updatedAt = new Date();
+  session.completedAt = new Date();
+
+  await saveHistory(session);
+  await sessionRef.set(session, { merge: true });
+  await receiptRef.set({
+    status: 'completed',
+    cashInstructionSent: session.cashInstructionSent,
+    processedAt: new Date()
+  }, { merge: true });
+
+  console.log('Shift complete:', session.rootMessageId);
 }
 
 async function processShiftReceiptImage(message, senderNumber) {
-  const currentReceiptRef = db.collection('shift_receipt_messages').doc(message.id);
-  const { ref: sessionRef, data: existingSession } = await loadActiveShiftSession(senderNumber);
+  const receiptRef = db.collection('shift_receipt_messages').doc(message.id);
+  const { ref: sessionRef, data: existingSession } = await loadSession(senderNumber);
 
+  // Meta may retry the same image webhook.
   if (
     existingSession &&
     (
@@ -283,36 +288,32 @@ async function processShiftReceiptImage(message, senderNumber) {
       (existingSession.retryMessageIds || []).includes(message.id)
     )
   ) {
-    console.log('Duplicate shift image webhook ignored:', message.id);
+    console.log('Duplicate shift image ignored:', message.id);
     return;
   }
+
+  await receiptRef.set({
+    id: message.id,
+    whatsappMessageId: message.id,
+    senderNumber,
+    mediaId: message.image?.id || null,
+    status: 'processing',
+    receivedAt: new Date()
+  }, { merge: true });
 
   const reasons = await getPayInOutReasons();
 
   try {
     const imageBuffer = await downloadWhatsAppImage(message.image?.id);
 
-    // -----------------------------------------------------
-    // RETRY PHOTO — read only the field previously requested
-    // -----------------------------------------------------
+    // --------------------------------------------------
+    // Small retry photo for one requested field only.
+    // --------------------------------------------------
     if (existingSession?.awaitingField) {
       const field = existingSession.awaitingField;
-      let partial;
+      const partial = await recognizeField(imageBuffer, field, reasons);
 
-      try {
-        partial = await recognizeReceiptField(imageBuffer, field, reasons);
-      } catch (fieldError) {
-        console.error('Field OCR error:', field, fieldError);
-        const reply = fieldPrompt(field, existingSession);
-        await sendWhatsAppMessage(senderNumber, reply);
-        await sessionRef.set(
-          { ...existingSession, updatedAt: new Date(), lastPrompt: reply },
-          { merge: true }
-        );
-        return;
-      }
-
-      const merged = {
+      const session = {
         ...existingSession,
         flowVersion: FLOW_VERSION,
         updatedAt: new Date(),
@@ -320,315 +321,125 @@ async function processShiftReceiptImage(message, senderNumber) {
       };
 
       if (field === 'branch' && partial.success) {
-        merged.branch = partial.branch;
-        merged.branchRaw = partial.branchRaw || null;
-      } else if (field === 'actual_ending_cash' && partial.success) {
-        merged.actualEndingCash = Number(partial.actualEndingCash);
-        merged.drawerValues = { ...(merged.drawerValues || {}), ...(partial.drawerValues || {}) };
-      } else if (field === 'difference' && partial.success) {
-        merged.difference = Number(partial.difference);
-      } else if (field === 'pay_totals' && partial.success) {
-        merged.payTotals = { ...(merged.payTotals || {}), ...(partial.totals || {}) };
-      } else if (field === 'pay_line' && partial.success) {
-        // Dedicated close-up is authoritative; do not merge stale full-photo OCR rows.
-        merged.payInOutItems = Array.isArray(partial.items) ? partial.items : [];
+        session.branch = partial.branch;
+        session.branchRaw = partial.branchRaw || null;
       }
 
-      // Reconcile only for storage quality. Printed Count remains authoritative for completion.
-      const payReconciled = reconcilePayItemsWithTotals(
-        merged.payInOutItems || [],
-        merged.payTotals || null
-      );
-      if (payReconciled.complete) merged.payInOutItems = payReconciled.items;
-
-      // Cash instruction is independent from Difference/Pay In-Out report completion.
-      const cash = await ensureCashInstruction(merged, message.id, senderNumber);
-      Object.assign(merged, cash);
-
-      const next = nextMissingField(merged);
-      if (next) {
-        const reply = fieldPrompt(next, merged);
-
-        // Avoid sending the same cash-independent recovery prompt twice in one retry.
-        if (next !== field || !partial.success) {
-          await sendWhatsAppMessage(senderNumber, reply);
-        } else if (next === field) {
-          await sendWhatsAppMessage(senderNumber, reply);
+      if (field === 'cash' && partial.success) {
+        session.actualEndingCash = partial.actualEndingCash;
+        session.drawerValues = {
+          ...(session.drawerValues || {}),
+          ...(partial.drawerValues || {})
+        };
+        if (Number.isFinite(Number(partial.difference))) {
+          session.difference = Number(partial.difference);
         }
-
-        await sessionRef.set(
-          {
-            ...merged,
-            awaitingField: next,
-            status: merged.cashInstructionSent ? 'cash_sent_waiting_report' : 'waiting_field',
-            lastPrompt: reply
-          },
-          { merge: true }
-        );
-
-        await currentReceiptRef.set(
-          {
-            status: 'field_retry_processed',
-            field,
-            nextField: next,
-            cashInstructionSent: merged.cashInstructionSent === true,
-            processedAt: new Date()
-          },
-          { merge: true }
-        );
-        return;
       }
 
-      await finalizeShiftRecord(merged, message.id, senderNumber);
-      await sessionRef.set(
-        { ...merged, awaitingField: null, status: 'completed', completedAt: new Date() },
-        { merge: true }
+      if (field === 'pay') {
+        session.payInOutItems = Array.isArray(partial.items) ? partial.items : [];
+        session.payTotals = partial.totals || null;
+        session.payComplete = Boolean(partial.success);
+      }
+
+      await continueSessionAfterRead(
+        session,
+        sessionRef,
+        receiptRef,
+        senderNumber
       );
-      await currentReceiptRef.set(
-        { status: 'field_retry_completed', processedAt: new Date() },
-        { merge: true }
-      );
-      console.log('Shift completed field-by-field:', merged.rootMessageId);
       return;
     }
 
-    // -----------------------------------------------------
-    // NEW FULL RECEIPT — salvage every field independently
-    // -----------------------------------------------------
-    await currentReceiptRef.set({
-      id: message.id,
-      whatsappMessageId: message.id,
-      senderNumber,
-      mediaId: message.image?.id || null,
-      status: 'processing',
-      receivedAt: new Date()
-    }, { merge: true });
-
-    let result = {};
-    try {
-      result = await recognizeReceipt(imageBuffer);
-    } catch (fullError) {
-      console.error('Full receipt OCR partial failure:', fullError);
-      result = {};
-    }
-
-    const safeField = async (field) => {
-      try {
-        return await recognizeReceiptField(imageBuffer, field, reasons);
-      } catch (error) {
-        console.warn('Best-effort field failed:', field, error.message);
-        return { success: false, field };
-      }
-    };
-
-    const [branchField, actualField, differenceField, totalsField] = await Promise.all([
-      result.branch
-        ? Promise.resolve({ success: true, branch: result.branch, branchRaw: result.branchRaw })
-        : safeField('branch'),
-      Number.isFinite(Number(result.actualEndingCash))
-        ? Promise.resolve({
-            success: true,
-            actualEndingCash: result.actualEndingCash,
-            drawerValues: result.drawerValues
-          })
-        : safeField('actual_ending_cash'),
-      Number.isFinite(Number(result.difference ?? result.drawerValues?.difference))
-        ? Promise.resolve({
-            success: true,
-            difference: result.difference ?? result.drawerValues?.difference
-          })
-        : safeField('difference'),
-      safeField('pay_totals')
-    ]);
-
-    const payText = result.payInOutText || result.text || '';
-    const initialItems = extractPayInOutItems(payText, reasons);
-    const initialTotals = totalsField.success
-      ? totalsField.totals
-      : extractPayTotalsAndCount(payText);
+    // --------------------------------------------------
+    // New full receipt.
+    // --------------------------------------------------
+    const result = await recognizeFullReceipt(imageBuffer, reasons);
 
     const session = {
       flowVersion: FLOW_VERSION,
       rootMessageId: message.id,
       senderNumber,
+      branch: result.branch || null,
+      branchRaw: result.branchRaw || null,
+      actualEndingCash: result.actualEndingCash,
+      drawerValues: result.drawerValues || null,
+      difference: Number.isFinite(Number(result.difference))
+        ? Number(result.difference)
+        : null,
+      payInOutItems: result.payInOutItems || [],
+      payTotals: result.payTotals || null,
+      payComplete: Boolean(result.payComplete),
+      cashInstructionSent: false,
+      retryMessageIds: [],
       status: 'processing',
       createdAt: new Date(),
-      updatedAt: new Date(),
-      branch: branchField.success ? branchField.branch : null,
-      branchRaw: branchField.branchRaw || null,
-      actualEndingCash: actualField.success ? Number(actualField.actualEndingCash) : null,
-      difference: differenceField.success ? Number(differenceField.difference) : null,
-      drawerValues: {
-        ...(result.drawerValues || {}),
-        ...(actualField.drawerValues || {})
-      },
-      payInOutItems: initialItems,
-      payTotals: initialTotals,
-      cashInstructionSent: false,
-      retryMessageIds: []
+      updatedAt: new Date()
     };
 
-    const initialReconciled = reconcilePayItemsWithTotals(
-      session.payInOutItems || [],
-      session.payTotals || null
+    await sessionRef.set(session, { merge: true });
+
+    await receiptRef.set({
+      detectedBranch: session.branch,
+      actualEndingCash: session.actualEndingCash,
+      payInOutItems: session.payInOutItems,
+      payTotals: session.payTotals,
+      ocrMode: FLOW_VERSION
+    }, { merge: true });
+
+    await continueSessionAfterRead(
+      session,
+      sessionRef,
+      receiptRef,
+      senderNumber
     );
-    if (initialReconciled.complete) session.payInOutItems = initialReconciled.items;
-
-    // 1) If Branch/Actual Cash are missing, ask ONLY for that critical field.
-    const critical = criticalMissingField(session);
-    if (critical) {
-      const reply = fieldPrompt(critical, session);
-      await sendWhatsAppMessage(senderNumber, reply);
-
-      await sessionRef.set(
-        {
-          ...session,
-          awaitingField: critical,
-          status: 'waiting_critical_field',
-          lastPrompt: reply
-        },
-        { merge: true }
-      );
-
-      await currentReceiptRef.set(
-        {
-          status: 'waiting_critical_field',
-          awaitingField: critical,
-          savedPartial: {
-            branch: session.branch,
-            actualEndingCash: session.actualEndingCash,
-            difference: session.difference,
-            payInOutItems: session.payInOutItems,
-            payTotals: session.payTotals
-          },
-          processedAt: new Date()
-        },
-        { merge: true }
-      );
-      return;
-    }
-
-    // 2) Branch + Actual Ending Cash are enough to tell employee what cash to remove.
-    const cash = await ensureCashInstruction(session, message.id, senderNumber);
-    Object.assign(session, cash);
-
-    // 3) Report details never block the cash instruction.
-    const reportMissing = reportMissingField(session);
-    if (reportMissing) {
-      const reportReply = fieldPrompt(reportMissing, session);
-      await sendWhatsAppMessage(senderNumber, reportReply);
-
-      await sessionRef.set(
-        {
-          ...session,
-          awaitingField: reportMissing,
-          status: 'cash_sent_waiting_report',
-          lastPrompt: reportReply
-        },
-        { merge: true }
-      );
-
-      await currentReceiptRef.set(
-        {
-          status: 'cash_instruction_sent_waiting_report',
-          awaitingField: reportMissing,
-          cashInstructionSent: session.cashInstructionSent === true,
-          processedAt: new Date()
-        },
-        { merge: true }
-      );
-      return;
-    }
-
-    await finalizeShiftRecord(session, message.id, senderNumber);
-    await sessionRef.set(
-      { ...session, awaitingField: null, status: 'completed', completedAt: new Date() },
-      { merge: true }
-    );
-    console.log('Shift completed from full image:', message.id);
   } catch (error) {
-    console.error('Shift receipt outer processing error:', message.id, error);
+    console.error('Shift receipt processing error:', message.id, error);
 
-    // Preserve everything already read. Never demand the whole receipt again.
-    if (existingSession) {
-      const current = {
-        ...existingSession,
-        flowVersion: FLOW_VERSION,
-        updatedAt: new Date()
-      };
+    // Never guess money after an OCR/media error.
+    const current = existingSession
+      ? { ...existingSession }
+      : {
+          flowVersion: FLOW_VERSION,
+          rootMessageId: message.id,
+          senderNumber,
+          branch: null,
+          actualEndingCash: null,
+          payInOutItems: [],
+          payTotals: null,
+          cashInstructionSent: false,
+          retryMessageIds: [],
+          createdAt: new Date()
+        };
 
-      // If cash is already readable, still try to send the employee instruction.
-      try {
-        const cash = await ensureCashInstruction(current, message.id, senderNumber);
-        Object.assign(current, cash);
-      } catch (cashError) {
-        console.error('Cash instruction recovery failed:', cashError);
-      }
+    const field = criticalMissing(current) || 'branch';
+    const reply = promptFor(field, Boolean(current.cashInstructionSent));
 
-      const field = nextMissingField(current) || existingSession.awaitingField || 'actual_ending_cash';
-      const reply = fieldPrompt(field, current);
-      await sendWhatsAppMessage(senderNumber, reply).catch(() => undefined);
-
-      await sessionRef.set(
-        {
-          ...current,
-          awaitingField: field,
-          status: current.cashInstructionSent ? 'cash_sent_waiting_report' : 'waiting_field',
-          lastPrompt: reply
-        },
-        { merge: true }
-      );
-      return;
-    }
-
-    // Catastrophic first-photo error: start with one small critical field, not whole receipt.
-    const seed = {
-      flowVersion: FLOW_VERSION,
-      rootMessageId: message.id,
-      senderNumber,
-      status: 'waiting_critical_field',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      retryMessageIds: [],
-      branch: null,
-      actualEndingCash: null,
-      difference: null,
-      payInOutItems: [],
-      payTotals: null,
-      cashInstructionSent: false
-    };
-
-    const field = 'branch';
-    const reply = fieldPrompt(field, seed);
     await sendWhatsAppMessage(senderNumber, reply).catch(() => undefined);
 
-    await sessionRef.set(
-      { ...seed, awaitingField: field, lastPrompt: reply },
-      { merge: true }
-    );
+    current.awaitingField = field;
+    current.status = 'waiting_after_error';
+    current.error = error.message;
+    current.updatedAt = new Date();
 
-    await currentReceiptRef.set(
-      {
-        status: 'waiting_critical_field',
-        awaitingField: field,
-        error: error.message,
-        processedAt: new Date()
-      },
-      { merge: true }
-    );
+    await sessionRef.set(current, { merge: true });
+    await receiptRef.set({
+      status: 'error_recovery',
+      awaitingField: field,
+      error: error.message,
+      processedAt: new Date()
+    }, { merge: true });
   }
 }
 
 router.post('/', async (req, res) => {
-  // Meta expects a quick 200 response.
+  // Meta expects a fast 200.
   res.sendStatus(200);
 
   try {
     const body = req.body;
 
-    if (body?.object !== 'whatsapp_business_account') {
-      return;
-    }
+    if (body?.object !== 'whatsapp_business_account') return;
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
@@ -638,21 +449,20 @@ router.post('/', async (req, res) => {
         for (const message of value.messages || []) {
           const senderNumber = message.from;
 
-          // NEW: Shift Summary photo automation. Existing text workflow below is unchanged.
           if (message.type === 'image') {
             await processShiftReceiptImage(message, senderNumber);
             continue;
           }
 
-          if (message.type !== 'text') {
-            continue;
-          }
+          if (message.type !== 'text') continue;
 
+          // Existing Staff Advance text workflow kept unchanged.
           const messageText = message.text?.body || '';
           const parsed = parseAdvanceMessage(messageText);
 
           const employeeName =
-            contacts.find((contact) => contact.wa_id === senderNumber)?.profile?.name || 'Unknown';
+            contacts.find((contact) => contact.wa_id === senderNumber)?.profile?.name ||
+            'Unknown';
 
           const requestData = {
             id: message.id,
@@ -672,13 +482,11 @@ router.post('/', async (req, res) => {
 
           console.log('Saved WhatsApp request:', message.id);
 
-          // Meta may retry the same webhook. Notify only for a genuinely new message.
           if (parsed.isAdvanceRequest && !existingRequest.exists) {
             try {
               const notificationResult = await sendAdvanceRequestNotification(requestData);
               console.log('FCM notification result:', notificationResult);
             } catch (notificationError) {
-              // Keep the WhatsApp webhook successful even if push delivery fails.
               console.error('FCM notification error:', notificationError);
             }
           }
